@@ -386,12 +386,21 @@ async function activateTabAndWindow(
   const windowId = tab.windowId ?? knownWindowId;
   if (windowId === undefined) throw new Error(`Chrome task window is unavailable: ${tabId}`);
   await windowsUpdate(windowId, { focused: true });
-  const [activeTab] = await tabsQuery({ active: true, windowId });
-  const focusedWindow = await windowsGet(windowId);
-  if (activeTab?.id !== tabId || focusedWindow.focused !== true) {
-    throw new Error("Chrome did not focus the exact controlled task tab");
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const [activeTab] = await tabsQuery({ active: true, windowId });
+    const focusedWindow = await windowsGet(windowId);
+    if (activeTab?.id === tabId && focusedWindow.focused === true) return tab;
+    if (attempt === 5 || attempt === 12) {
+      await tabsUpdate(tabId, { active: true });
+      await windowsUpdate(windowId, { focused: true });
+    }
+    await delay(50);
   }
-  return tab;
+  throw new Error("Chrome did not focus the exact controlled task tab");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function ensureDebuggerAttached(tabId: number) {
