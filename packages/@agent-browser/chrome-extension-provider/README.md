@@ -115,3 +115,5 @@ AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION=1 \
 ```
 
 The harness compiles `AGENT_BROWSER_E2E_BRIDGE_PORT` into its disposable extension build, so isolated ports exercise the real extension instead of silently connecting to the production default. On Chrome versions that gate loopback access, approve the Local Network Access prompt in the fresh test profile. With the strict flag, a missing extension connection fails rather than being reported as a real extension pass.
+
+CI additionally pins Chrome for Testing `150.0.7871.24` and sets `AGENT_BROWSER_E2E_HEADLESS=1` plus `AGENT_BROWSER_E2E_BYPASS_LNA=1`. The latter disables Chrome's Local Network Access checks only inside the disposable CI browser so extension code is exercised without an interactive permission prompt. Release validation must still run the headed persistent-profile bootstrap and fresh-profile GUI gate to cover the real permission experience.

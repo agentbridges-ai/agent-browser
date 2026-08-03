@@ -16,17 +16,20 @@ type StoredConfig = {
 
 const DEFAULT_PORT = __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__;
 const CONTROL_BINDING = "__agentBrowserControl";
+const CONTROL_WORLD = "__agentBrowserOperatorWorld";
 const attachedTabs = new Set<number>();
-const controlOverlays = new Map<
-  number,
-  {
-    nonce: string;
-    sessionId: string;
-    phase: "agent" | "human" | "stopped";
-    returnPath?: string;
-    returnOrigin?: string;
-  }
->();
+type ControlOverlay = {
+  nonce: string;
+  sessionId: string;
+  phase: "agent" | "human" | "stopped";
+  returnPath?: string;
+  returnOrigin?: string;
+  frameId?: string;
+  executionContextId?: number;
+};
+const controlOverlays = new Map<number, ControlOverlay>();
+const controlBindingTabs = new Set<number>();
+const controlOverlaySyncs = new Map<number, Promise<void>>();
 let bridge: WebSocket | null = null;
 let activePort = DEFAULT_PORT;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -94,19 +97,32 @@ export default defineBackground(() => {
     }
     attachedTabs.delete(tabId);
     controlOverlays.delete(tabId);
+    controlBindingTabs.delete(tabId);
+    controlOverlaySyncs.delete(tabId);
     scheduleHeartbeat();
   });
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (!source.tabId) return;
     if (method === "Runtime.bindingCalled" && handleControlBinding(source.tabId, params)) return;
-    if (method === "Page.frameNavigated" || method === "Page.loadEventFired") {
-      const overlay = controlOverlays.get(source.tabId);
-      if (overlay) {
-        setTimeout(
-          () => void injectControlOverlay(source.tabId as number, overlay).catch(() => undefined),
-          25,
-        );
+    const overlay = controlOverlays.get(source.tabId);
+    if (overlay && method === "Page.frameNavigated") {
+      const frame = (params as { frame?: { id?: unknown; parentId?: unknown } } | undefined)?.frame;
+      if (typeof frame?.id === "string" && frame.parentId === undefined) {
+        overlay.frameId = frame.id;
+        overlay.executionContextId = undefined;
       }
+    }
+    if (overlay && method === "Runtime.executionContextDestroyed") {
+      const executionContextId = (
+        params as { executionContextId?: unknown; executionContextUniqueId?: unknown } | undefined
+      )?.executionContextId;
+      if (executionContextId === overlay.executionContextId) overlay.executionContextId = undefined;
+    }
+    if (overlay && method === "Runtime.executionContextsCleared") {
+      overlay.executionContextId = undefined;
+    }
+    if (overlay && (method === "Page.frameNavigated" || method === "Page.loadEventFired")) {
+      setTimeout(() => void syncControlOverlay(source.tabId as number).catch(() => undefined), 25);
     }
     void sendBridgeMessage({
       v: BRIDGE_PROTOCOL_VERSION,
@@ -125,6 +141,8 @@ export default defineBackground(() => {
       }
       attachedTabs.delete(source.tabId);
       controlOverlays.delete(source.tabId);
+      controlBindingTabs.delete(source.tabId);
+      controlOverlaySyncs.delete(source.tabId);
     }
     if (!source.tabId) return;
     void sendBridgeMessage({
@@ -307,12 +325,14 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
       nonce: current?.sessionId === sessionId ? current.nonce : crypto.randomUUID(),
       sessionId,
       phase,
+      frameId: current?.frameId,
+      executionContextId: current?.executionContextId,
       ...(phase === "human" && returnPath && returnOrigin
         ? { returnPath, returnOrigin }
         : {}),
     };
     controlOverlays.set(tabId, overlay);
-    await injectControlOverlay(tabId, overlay);
+    await syncControlOverlay(tabId);
     return { visible: true, phase };
   }
   if (command.method === "Bridge.detachTab") {
@@ -320,13 +340,15 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     const overlay = controlOverlays.get(tabId);
     if (overlay) {
       overlay.phase = "stopped";
-      await injectControlOverlay(tabId, overlay).catch(() => undefined);
+      await syncControlOverlay(tabId).catch(() => undefined);
     }
     if (attachedTabs.has(tabId)) {
       await debuggerDetach({ tabId }).catch(() => undefined);
     }
     attachedTabs.delete(tabId);
     controlOverlays.delete(tabId);
+    controlBindingTabs.delete(tabId);
+    controlOverlaySyncs.delete(tabId);
     return { detached: true };
   }
   const tabId = command.tabId;
@@ -338,7 +360,7 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     await activateTabAndWindow(tabId);
   }
   const overlay = controlOverlays.get(tabId);
-  if (overlay) await injectControlOverlay(tabId, overlay);
+  if (overlay) await syncControlOverlay(tabId);
   return await debuggerSendCommand({ tabId }, command.method, command.params ?? {});
 }
 
@@ -380,10 +402,16 @@ async function ensureDebuggerAttached(tabId: number) {
 
 function handleControlBinding(tabId: number, params: unknown): boolean {
   if (!params || typeof params !== "object") return false;
-  const value = params as { name?: unknown; payload?: unknown };
+  const value = params as { name?: unknown; payload?: unknown; executionContextId?: unknown };
   if (value.name !== CONTROL_BINDING || typeof value.payload !== "string") return false;
   const overlay = controlOverlays.get(tabId);
   if (!overlay) return true;
+  if (
+    typeof value.executionContextId !== "number" ||
+    value.executionContextId !== overlay.executionContextId
+  ) {
+    return true;
+  }
   try {
     const payload = JSON.parse(value.payload) as { nonce?: unknown; action?: unknown };
     if (payload.nonce !== overlay.nonce) return true;
@@ -434,20 +462,48 @@ async function emitDetach(
   });
 }
 
-async function injectControlOverlay(
-  tabId: number,
-  overlay: {
-    nonce: string;
-    sessionId: string;
-    phase: "agent" | "human" | "stopped";
-    returnPath?: string;
-    returnOrigin?: string;
-  },
-): Promise<void> {
-  await debuggerSendCommand({ tabId }, "Runtime.enable", {}).catch(() => undefined);
-  await debuggerSendCommand({ tabId }, "Runtime.addBinding", { name: CONTROL_BINDING }).catch(
-    () => undefined,
-  );
+async function syncControlOverlay(tabId: number): Promise<void> {
+  const previous = controlOverlaySyncs.get(tabId);
+  const current = (previous ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(() => injectCurrentControlOverlay(tabId));
+  controlOverlaySyncs.set(tabId, current);
+  try {
+    await current;
+  } finally {
+    if (controlOverlaySyncs.get(tabId) === current) controlOverlaySyncs.delete(tabId);
+  }
+}
+
+async function injectCurrentControlOverlay(tabId: number): Promise<void> {
+  const overlay = controlOverlays.get(tabId);
+  if (!overlay) return;
+  await debuggerSendCommand({ tabId }, "Runtime.enable", {});
+  const frameTree = (await debuggerSendCommand({ tabId }, "Page.getFrameTree", {})) as {
+    frameTree?: { frame?: { id?: unknown } };
+  };
+  const frameId = frameTree.frameTree?.frame?.id;
+  if (typeof frameId !== "string" || !frameId) {
+    throw new Error("Chrome did not expose the controlled page frame");
+  }
+  if (!controlBindingTabs.has(tabId)) {
+    await debuggerSendCommand({ tabId }, "Runtime.addBinding", {
+      name: CONTROL_BINDING,
+      executionContextName: CONTROL_WORLD,
+    });
+    controlBindingTabs.add(tabId);
+  }
+  if (overlay.frameId !== frameId || typeof overlay.executionContextId !== "number") {
+    const isolatedWorld = (await debuggerSendCommand({ tabId }, "Page.createIsolatedWorld", {
+      frameId,
+      worldName: CONTROL_WORLD,
+    })) as { executionContextId?: unknown };
+    if (typeof isolatedWorld.executionContextId !== "number") {
+      throw new Error("Chrome did not create the operator control world");
+    }
+    overlay.frameId = frameId;
+    overlay.executionContextId = isolatedWorld.executionContextId;
+  }
   const config = JSON.stringify({
     binding: CONTROL_BINDING,
     nonce: overlay.nonce,
@@ -461,7 +517,8 @@ async function injectControlOverlay(
     const host = document.createElement("div");
     host.id = id;
     host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none;box-shadow:inset 0 0 0 3px #2563eb,inset 0 0 28px rgba(37,99,235,.38);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif";
-    const shadow = host.attachShadow({ mode: "open" });
+    const shadow = host.attachShadow({ mode: "closed" });
+    const binding = globalThis[config.binding];
     const bar = document.createElement("div");
     bar.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:999px;background:#111827;color:#fff;box-shadow:0 8px 28px rgba(0,0,0,.35);pointer-events:auto;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif";
     const label = document.createElement("span");
@@ -473,8 +530,8 @@ async function injectControlOverlay(
       node.textContent = text;
       node.type = "button";
       node.style.cssText = "all:unset;cursor:pointer;border-radius:999px;padding:7px 11px;background:" + (primary ? "#2563eb" : "#374151") + ";color:#fff;font-weight:700";
-      node.addEventListener("click", () => {
-        const binding = window[config.binding];
+      node.addEventListener("click", (event) => {
+        if (!event.isTrusted) return;
         if (typeof binding === "function") binding(JSON.stringify({ nonce: config.nonce, action }));
       });
       return node;
@@ -489,6 +546,7 @@ async function injectControlOverlay(
   })()`;
   await debuggerSendCommand({ tabId }, "Runtime.evaluate", {
     expression,
+    contextId: overlay.executionContextId,
     awaitPromise: false,
     returnByValue: true,
   });

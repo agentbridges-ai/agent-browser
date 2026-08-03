@@ -144,6 +144,20 @@ jobs:
       - name: Build Chrome extension provider
         run: pnpm --filter @agent-browser/chrome-extension-provider build
 
+      - name: Setup pinned Chrome for Testing
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: 150.0.7871.24
+
+      - name: Test real Chrome extension bridge
+        env:
+          AGENT_BROWSER_E2E_CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+          AGENT_BROWSER_E2E_BYPASS_LNA: "1"
+          AGENT_BROWSER_E2E_HEADLESS: "1"
+          AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION: "1"
+        run: pnpm --filter @agent-browser/chrome-extension-provider test:browser-e2e
+
   rust-cross:
     name: Rust (${{ matrix.os }} - ${{ matrix.target }})
     if: github.event_name != 'pull_request'

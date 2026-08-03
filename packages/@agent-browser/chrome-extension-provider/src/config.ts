@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 export const DEFAULT_BRIDGE_PORT = 19826;
@@ -13,13 +14,26 @@ export type BridgeConfig = {
   extensionId?: string;
   logPath?: string;
   statePath?: string;
+  legacyStatePaths: string[];
   supervisedByNexolyra: boolean;
 };
 
 export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   const logPath = nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG);
+  const explicitStatePath = nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE);
+  const port = parsePort(env.AGENT_BROWSER_CHROME_BRIDGE_PORT);
+  const statePath =
+    explicitStatePath ||
+    join(
+      homedir(),
+      ".agent-browser",
+      "chrome-extension-provider",
+      String(port),
+      "sessions.json",
+    );
+  const legacyStatePath = join(logPath ? dirname(logPath) : process.cwd(), "sessions.json");
   return {
-    port: parsePort(env.AGENT_BROWSER_CHROME_BRIDGE_PORT),
+    port,
     profileId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE),
     profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
     returnOrigin: parseReturnOrigin(env.AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN),
@@ -28,9 +42,9 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
       parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID) ??
       PINNED_CHROME_EXTENSION_ID,
     logPath,
-    statePath:
-      nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE) ||
-      join(logPath ? dirname(logPath) : process.cwd(), "sessions.json"),
+    statePath,
+    legacyStatePaths:
+      explicitStatePath || legacyStatePath === statePath ? [] : [legacyStatePath],
     supervisedByNexolyra: env.NEXOLYRA_AGENT_BROWSER_DAEMON_SUPERVISED === "1",
   };
 }
