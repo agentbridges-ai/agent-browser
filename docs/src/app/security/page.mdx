@@ -24,6 +24,7 @@ These features are designed to mitigate the following threats when an LLM-based 
 - **iOS, Safari, and direct-page provider plugins do not support the domain allowlist.** agent-browser rejects `--allowed-domains` with these providers because their automation backends cannot install the Chromium network controls or enforce equivalent WebRTC containment.
 - **Content boundaries are defense-in-depth.** They rely on the LLM and orchestrator respecting the structural markers. A sufficiently capable adversarial page could attempt to mimic the boundary format, though the per-process CSPRNG nonce makes this impractical to predict.
 - **Plugins are local executables.** Install credential plugins only from maintainers you trust. agent-browser limits the data it sends to plugins and supports policy gates, but it does not sandbox arbitrary local executables.
+- **Chrome extension bridge permissions are powerful.** The optional Chrome extension bridge provider uses the extension `debugger` permission and a localhost daemon to control the current Chrome profile. Install it only in profiles where that level of local automation is acceptable.
 - **Plugin config is not secret storage.** Do not put vault tokens or passwords in plugin command args. Use the vendor's own login/session mechanism or environment outside agent-browser config.
 - **Confirmation timeout.** Pending confirmations auto-deny after 60 seconds. Orchestrators must respond within that window.
 - **Non-TTY auto-deny.** When `--confirm-interactive` is set but stdin is not a terminal (e.g., piped input), actions are automatically denied to prevent accidental approval in non-interactive contexts.
@@ -90,6 +91,11 @@ See [Plugins](/plugins) for the plugin author protocol and implementation exampl
       "capabilities": ["browser.provider"]
     },
     {
+      "name": "chrome-extension",
+      "command": "agent-browser-plugin-chrome-extension",
+      "capabilities": ["browser.provider", "command.run", "chrome-extension.manage"]
+    },
+    {
       "name": "stealth",
       "command": "agent-browser-plugin-stealth",
       "capabilities": ["launch.mutate"]
@@ -120,15 +126,19 @@ Use a plugin as a browser provider:
 
 ```bash
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 ```
 
 Use a generic plugin command:
 
 ```bash
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
 Credential plugins receive `credential.resolve` and return username, password, and optionally URL or selector metadata. Browser provider plugins receive `browser.launch` and return a CDP WebSocket URL. Launch mutator plugins receive `launch.mutate` and can append local launch args, extensions, or init script source before Chrome starts. Generic command plugins receive the request type passed to `plugin run`.
+
+The Chrome extension bridge provider is opt-in and only activates when selected with `--provider chrome-extension`. Its daemon listens on `127.0.0.1`, pins bridge WebSocket connections to the bundled extension identity, validates per-session CDP tokens, and treats `browser.close` as detach so it does not close the user's desktop Chrome.
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths so credential, browser-provider, and launch-mutator access stays inside the normal policy gates.
 
@@ -139,6 +149,7 @@ Gate plugin access with capability actions:
 ```bash
 agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
+agent-browser --confirm-actions plugin:chrome-extension:browser.provider --provider chrome-extension open https://example.com
 agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
 ```
 

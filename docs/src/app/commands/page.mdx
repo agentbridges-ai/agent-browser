@@ -376,6 +376,7 @@ Other plugin capabilities use the same protocol:
 - `browser.provider`: use the plugin with `--provider <name>` to return a CDP WebSocket URL
 - `launch.mutate`: append local launch args, extensions, or init scripts before Chrome starts
 - `command.run`: run arbitrary namespaced requests through `agent-browser plugin run`
+- `chrome-extension.manage`: inspect the optional Chrome extension bridge provider through `agent-browser plugin run chrome-extension chrome-extension.status`
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
@@ -385,7 +386,9 @@ agent-browser auth login github
 agent-browser plugin add agent-browser-plugin-vault --name vault
 agent-browser auth login my-app --credential-provider vault --item "My App"
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 agent-browser auth list
 ```
 

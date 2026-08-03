@@ -1,0 +1,111 @@
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+export const DEFAULT_BRIDGE_PORT = 19826;
+export const PINNED_CHROME_EXTENSION_ID = "pimcamjccpkgapdpecfiadkemnggggbj";
+
+export type BridgeConfig = {
+  port: number;
+  profileId?: string;
+  profileUrlHint?: string;
+  returnOrigin?: string;
+  daemonCommand?: string;
+  extensionId?: string;
+  logPath?: string;
+  statePath?: string;
+  supervisedByNexolyra: boolean;
+};
+
+export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
+  const logPath = nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG);
+  return {
+    port: parsePort(env.AGENT_BROWSER_CHROME_BRIDGE_PORT),
+    profileId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE),
+    profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
+    returnOrigin: parseReturnOrigin(env.AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN),
+    daemonCommand: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_DAEMON),
+    extensionId:
+      parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID) ??
+      PINNED_CHROME_EXTENSION_ID,
+    logPath,
+    statePath:
+      nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE) ||
+      join(logPath ? dirname(logPath) : process.cwd(), "sessions.json"),
+    supervisedByNexolyra: env.NEXOLYRA_AGENT_BROWSER_DAEMON_SUPERVISED === "1",
+  };
+}
+
+export function parseExtensionId(value: string | undefined): string | undefined {
+  const extensionId = nonEmpty(value);
+  if (!extensionId) return undefined;
+  if (!/^[a-p]{32}$/.test(extensionId)) {
+    throw new Error(
+      "AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID must be a 32-character Chrome extension id",
+    );
+  }
+  return extensionId;
+}
+
+export function parsePort(value: string | undefined): number {
+  if (!value) return DEFAULT_BRIDGE_PORT;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `AGENT_BROWSER_CHROME_BRIDGE_PORT must be an integer from 1 to 65535; got ${value}`,
+    );
+  }
+  return port;
+}
+
+export function parseProfileUrlHint(value: string | undefined): string | undefined {
+  const hint = nonEmpty(value);
+  if (!hint) return undefined;
+  if (!hint.startsWith("/") || hint.length > 512 || /[\u0000-\u001f\u007f]/.test(hint)) {
+    throw new Error(
+      "AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT must be a pathname suffix of at most 512 characters",
+    );
+  }
+  return hint.length > 1 ? hint.replace(/\/+$/, "") : hint;
+}
+
+export function parseReturnOrigin(value: string | undefined): string | undefined {
+  const candidate = nonEmpty(value);
+  if (!candidate) return undefined;
+  try {
+    const parsed = new URL(candidate);
+    const loopback =
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "localhost" ||
+      parsed.hostname === "[::1]";
+    if (
+      !loopback ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash ||
+      candidate.length > 256
+    ) {
+      throw new Error("invalid return origin");
+    }
+    return parsed.origin;
+  } catch {
+    throw new Error(
+      "AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN must be an HTTP(S) loopback origin",
+    );
+  }
+}
+
+export function defaultDaemonScriptUrl(): URL {
+  return new URL("./daemon/cli.js", import.meta.url);
+}
+
+export function defaultDaemonScriptPath(): string {
+  return fileURLToPath(defaultDaemonScriptUrl());
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}

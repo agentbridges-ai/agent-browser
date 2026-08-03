@@ -1,0 +1,54 @@
+{
+  "name": "@agent-browser/chrome-extension-provider",
+  "version": "0.33.2",
+  "description": "Chrome extension bridge provider for agent-browser",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    ".output/chrome-mv3",
+    "README.md"
+  ],
+  "bin": {
+    "chrome-extension-provider": "./dist/plugin.js",
+    "agent-browser-plugin-chrome-extension": "./dist/plugin.js",
+    "agent-browser-chrome-bridge-daemon": "./dist/daemon/cli.js"
+  },
+  "scripts": {
+    "build": "pnpm run build:node && pnpm run build:extension",
+    "build:extension": "wxt build --browser chrome",
+    "build:node": "tsc -p tsconfig.json",
+    "prepack": "pnpm run build",
+    "test": "pnpm run build:node && node --test test/daemon.test.mjs test/plugin.test.mjs",
+    "test:browser-e2e": "pnpm run build && node --test test/browser-e2e.test.mjs"
+  },
+  "keywords": [
+    "agent-browser",
+    "chrome",
+    "extension",
+    "cdp",
+    "browser-automation"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel-labs/agent-browser",
+    "directory": "packages/@agent-browser/chrome-extension-provider"
+  },
+  "bugs": {
+    "url": "https://github.com/vercel-labs/agent-browser/issues"
+  },
+  "homepage": "https://agent-browser.dev/providers/chrome-extension",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "ws": "8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3",
+    "wxt": "0.20.27"
+  }
+}

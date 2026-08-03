@@ -1,0 +1,1 @@
+export const CHROME_EXTENSION_PROVIDER_VERSION = "0.33.2";

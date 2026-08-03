@@ -3445,6 +3445,7 @@ Capabilities:
   browser.provider         Launch/connect an external browser provider
   launch.mutate            Append local launch args, extensions, or init scripts
   command.run              Accept arbitrary namespaced plugin requests
+  chrome-extension.manage  Inspect the optional Chrome extension bridge
 
 Core capabilities and protocol request types use dedicated command paths.
 Use auth login for credential.read, --provider for browser.provider, and
@@ -3464,12 +3465,15 @@ Example config:
 Examples:
   agent-browser plugin add agent-browser-plugin-captcha
   agent-browser plugin add org/agent-browser-plugin-cloud-browser
+  agent-browser plugin add @agent-browser/chrome-extension-provider --name chrome-extension
   agent-browser plugin add @company/agent-browser-plugin-vault --name vault
   agent-browser plugin list
   agent-browser plugin show vault
   agent-browser plugin run captcha captcha.solve --payload '{{"siteKey":"...","url":"https://example.com"}}'
+  agent-browser plugin run chrome-extension chrome-extension.status
   agent-browser auth login my-app --credential-provider vault --item "My App"
   agent-browser --provider cloud-browser open https://example.com
+  agent-browser --provider chrome-extension open https://example.com
 "##
         }
 

@@ -170,6 +170,11 @@ agent-browser plugin add org/agent-browser-plugin-cloud-browser
       "capabilities": ["browser.provider"]
     },
     {
+      "name": "chrome-extension",
+      "command": "agent-browser-plugin-chrome-extension",
+      "capabilities": ["browser.provider", "command.run", "chrome-extension.manage"]
+    },
+    {
       "name": "stealth",
       "command": "agent-browser-plugin-stealth",
       "capabilities": ["launch.mutate"]
@@ -200,7 +205,9 @@ Use a plugin as a browser provider or a generic domain command:
 
 ```bash
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
@@ -212,6 +219,7 @@ Gate plugin secret access separately from normal login automation:
 ```bash
 agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
+agent-browser --confirm-actions plugin:chrome-extension:browser.provider --provider chrome-extension open https://example.com
 agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
 ```
 

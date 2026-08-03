@@ -119,6 +119,31 @@ jobs:
       - name: Test Eve package
         run: pnpm --filter @agent-browser/eve test
 
+  chrome-extension-provider:
+    name: Chrome Extension Provider
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test Chrome extension provider
+        run: pnpm --filter @agent-browser/chrome-extension-provider test
+
+      - name: Build Chrome extension provider
+        run: pnpm --filter @agent-browser/chrome-extension-provider build
+
   rust-cross:
     name: Rust (${{ matrix.os }} - ${{ matrix.target }})
     if: github.event_name != 'pull_request'

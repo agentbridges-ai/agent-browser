@@ -100,6 +100,86 @@ if (currentSandboxVersionSource !== sandboxVersionSource) {
   console.log(`  packages/@agent-browser/sandbox/src/version.ts already up to date`);
 }
 
+// Update packages/@agent-browser/chrome-extension-provider/package.json
+const chromeExtensionProviderPkgPath = join(
+  rootDir,
+  "packages",
+  "@agent-browser",
+  "chrome-extension-provider",
+  "package.json",
+);
+const chromeExtensionProviderPkg = JSON.parse(
+  readFileSync(chromeExtensionProviderPkgPath, "utf-8"),
+);
+if (chromeExtensionProviderPkg.version !== version) {
+  const oldVersion = chromeExtensionProviderPkg.version;
+  chromeExtensionProviderPkg.version = version;
+  writeFileSync(
+    chromeExtensionProviderPkgPath,
+    JSON.stringify(chromeExtensionProviderPkg, null, 2) + "\n",
+  );
+  console.log(
+    `  Updated packages/@agent-browser/chrome-extension-provider/package.json: ${oldVersion} -> ${version}`,
+  );
+} else {
+  console.log(`  packages/@agent-browser/chrome-extension-provider/package.json already up to date`);
+}
+
+// Update chrome extension provider runtime version constant
+const chromeExtensionProviderVersionPath = join(
+  rootDir,
+  "packages",
+  "@agent-browser",
+  "chrome-extension-provider",
+  "src",
+  "version.ts",
+);
+const chromeExtensionProviderVersionSource = `export const CHROME_EXTENSION_PROVIDER_VERSION = "${version}";\n`;
+const currentChromeExtensionProviderVersionSource = readFileSync(
+  chromeExtensionProviderVersionPath,
+  "utf-8",
+);
+if (currentChromeExtensionProviderVersionSource !== chromeExtensionProviderVersionSource) {
+  writeFileSync(chromeExtensionProviderVersionPath, chromeExtensionProviderVersionSource);
+  console.log(
+    `  Updated packages/@agent-browser/chrome-extension-provider/src/version.ts -> ${version}`,
+  );
+} else {
+  console.log(
+    `  packages/@agent-browser/chrome-extension-provider/src/version.ts already up to date`,
+  );
+}
+
+// Update chrome extension manifest version
+const chromeExtensionProviderWxtPath = join(
+  rootDir,
+  "packages",
+  "@agent-browser",
+  "chrome-extension-provider",
+  "wxt.config.ts",
+);
+let chromeExtensionProviderWxt = readFileSync(chromeExtensionProviderWxtPath, "utf-8");
+const chromeExtensionManifestVersionRegex = /version: "[^"]*"/;
+const newChromeExtensionManifestVersion = `version: "${version}"`;
+if (chromeExtensionManifestVersionRegex.test(chromeExtensionProviderWxt)) {
+  const oldMatch = chromeExtensionProviderWxt.match(chromeExtensionManifestVersionRegex)?.[0];
+  if (oldMatch !== newChromeExtensionManifestVersion) {
+    chromeExtensionProviderWxt = chromeExtensionProviderWxt.replace(
+      chromeExtensionManifestVersionRegex,
+      newChromeExtensionManifestVersion,
+    );
+    writeFileSync(chromeExtensionProviderWxtPath, chromeExtensionProviderWxt);
+    console.log(
+      `  Updated packages/@agent-browser/chrome-extension-provider/wxt.config.ts: ${oldMatch} -> ${newChromeExtensionManifestVersion}`,
+    );
+  } else {
+    console.log(`  packages/@agent-browser/chrome-extension-provider/wxt.config.ts already up to date`);
+  }
+} else {
+  console.error("  Could not find version field in packages/@agent-browser/chrome-extension-provider/wxt.config.ts");
+  process.exit(1);
+}
+
 // Update Cargo.lock to match Cargo.toml
 if (cargoTomlUpdated) {
   try {

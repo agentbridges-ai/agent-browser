@@ -329,7 +329,7 @@ impl StreamServer {
         let port = actual_addr.port();
 
         let (frame_tx, _) = broadcast::channel::<String>(64);
-        let (frame_watch_tx, frame_watch_rx) = watch::channel::<Option<Arc<StreamFrame>>>(None);
+        let (frame_watch_tx, _) = watch::channel::<Option<Arc<StreamFrame>>>(None);
         let screencast_config = Arc::new(ScreencastConfig::from_env());
         let client_count = Arc::new(Mutex::new(0usize));
         let client_notify = Arc::new(Notify::new());
@@ -357,7 +357,7 @@ impl StreamServer {
         let recording_clone = recording.clone();
         let accept_shutdown_rx = shutdown_rx.clone();
         let session_name_clone = session_id.clone();
-        let frame_watch_accept = frame_watch_rx.clone();
+        let frame_watch_accept = frame_watch_tx.clone();
         let accept_task = tokio::spawn(async move {
             websocket::accept_loop(
                 listener,

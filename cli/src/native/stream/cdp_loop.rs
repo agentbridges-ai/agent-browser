@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
@@ -111,6 +112,34 @@ pub(super) async fn cdp_event_loop(
                     "recording": rec,
                 });
                 let _ = frame_tx.send(status.to_string());
+
+                // A static page in an occluded/background Chrome window may not emit an
+                // initial Page.screencastFrame. Seed Live with one bounded viewport capture,
+                // but never delay the event stream for more than a short fallback window.
+                if supports_screencast {
+                    if let Some(data) = capture_live_seed(&client_arc, session_id.as_deref()).await
+                    {
+                        let seq = super::next_frame_seq();
+                        let msg = json!({
+                            "type": "frame",
+                            "seq": seq,
+                            "data": data,
+                            "metadata": {
+                                "offsetTop": 0.0,
+                                "pageScaleFactor": 1.0,
+                                "deviceWidth": vw,
+                                "deviceHeight": vh,
+                                "scrollOffsetX": 0.0,
+                                "scrollOffsetY": 0.0,
+                                "timestamp": timestamp_ms(),
+                            }
+                        });
+                        frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
+                            seq: Some(seq),
+                            json: msg.to_string(),
+                        })));
+                    }
+                }
 
                 loop {
                     tokio::select! {
@@ -294,6 +323,37 @@ pub(super) async fn cdp_event_loop(
             drop(guard);
         }
     }
+}
+
+/// Capture one seed frame for pages that do not emit a screencast frame while
+/// they are occluded. Extension-backed Chrome providers may not support the
+/// compositor `fromSurface` route for a background window, so retry through
+/// the visible-tab bridge route before giving up.
+async fn capture_live_seed(client: &CdpClient, session_id: Option<&str>) -> Option<String> {
+    for from_surface in [true, false] {
+        let capture = tokio::time::timeout(
+            Duration::from_millis(1_000),
+            client.send_command(
+                "Page.captureScreenshot",
+                Some(json!({
+                    "format": "jpeg",
+                    "quality": 60,
+                    "fromSurface": from_surface,
+                    "captureBeyondViewport": false,
+                })),
+                session_id,
+            ),
+        )
+        .await;
+        if let Ok(Ok(capture)) = capture {
+            if let Some(data) = capture.get("data").and_then(|value| value.as_str()) {
+                if !data.is_empty() {
+                    return Some(data.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 pub async fn start_screencast(

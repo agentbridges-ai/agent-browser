@@ -1,0 +1,93 @@
+# Chrome Extension Bridge
+
+The optional Chrome Extension Bridge provider connects agent-browser to an already running desktop Chrome profile through an unpacked MV3 extension and a local bridge daemon.
+
+This is a configured `browser.provider` plugin. It returns a local CDP WebSocket URL, so browser automation, snapshots, policy checks, and output handling stay in agent-browser core. Local launch, `--cdp`, `--auto-connect`, and `--profile` behavior do not change unless you explicitly select this provider.
+
+## Setup
+
+Build the provider package and extension from a workspace checkout:
+
+```bash
+pnpm --filter @agent-browser/chrome-extension-provider build
+```
+
+Load this unpacked extension directory in Chrome:
+
+```text
+packages/@agent-browser/chrome-extension-provider/.output/chrome-mv3
+```
+
+Add the provider plugin:
+
+```bash
+agent-browser plugin add @agent-browser/chrome-extension-provider --name chrome-extension
+```
+
+Or configure it manually:
+
+```json
+{
+  "plugins": [
+    {
+      "name": "chrome-extension",
+      "command": "agent-browser-plugin-chrome-extension",
+      "capabilities": ["browser.provider", "command.run", "chrome-extension.manage"]
+    }
+  ]
+}
+```
+
+Use it with `--provider`:
+
+```bash
+agent-browser --provider chrome-extension open https://example.com
+agent-browser snapshot -i
+```
+
+## Status
+
+Check daemon and extension connectivity:
+
+```bash
+agent-browser plugin run chrome-extension chrome-extension.status
+```
+
+Status includes the unpacked extension path, daemon port, bridge protocol version, connected profile ids, extension id, and current tabs.
+
+## Configuration
+
+<table>
+  <thead>
+    <tr><th>Variable</th><th>Description</th><th>Default</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PORT</code></td><td>Local daemon port</td><td><code>19826</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PROFILE</code></td><td>Profile id to use when multiple extension profiles are connected</td><td>Auto-selects when only one profile is connected</td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_DAEMON</code></td><td>Override daemon executable path</td><td>Bundled daemon</td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID</code></td><td>Override the bundled extension id allowed to connect</td><td><code>pimcamjccpkgapdpecfiadkemnggggbj</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_LOG</code></td><td>Optional daemon log file</td><td>No file logging</td></tr>
+  </tbody>
+</table>
+
+The extension connects to port `19826` by default. For a custom daemon port, set `chrome.storage.local.bridgePort` or `chrome.storage.local.bridgePorts` in the extension profile to match `AGENT_BROWSER_CHROME_BRIDGE_PORT`.
+
+The daemon pins `/bridge` to the bundled extension id by default and validates both the browser-supplied WebSocket Origin and the extension hello identity. It also rejects browser-origin requests from host control routes while allowing the pinned extension to read the onboarding health route. This prevents an ordinary web page or a different extension from impersonating or mutating the bridge. Set `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` only when testing a custom build with a different manifest identity.
+
+## How it works
+
+The plugin starts or reuses `agent-browser-chrome-bridge-daemon`, waits for the extension service worker to connect, registers a one-time bridge session token, then returns a URL like:
+
+```text
+ws://127.0.0.1:19826/devtools/browser/bridge?session=...&token=...
+```
+
+agent-browser sends normal CDP JSON-RPC to that URL. The daemon handles browser-level `Target.*` commands for tabs and forwards page-level CDP commands to the extension. The extension uses `chrome.debugger.attach` and `chrome.debugger.sendCommand` against the selected tab.
+
+Read-only observation can stay in the background. Before true keyboard, mouse, or touch input, the provider activates the exact task tab and confirms that its Chrome window is focused so input cannot silently land on an unrelated window.
+
+## Limits
+
+The MVP targets ordinary web pages in desktop Chrome 120 or newer. It does not support `chrome://` pages, browser UI pages, automation of other extension pages, Chrome Web Store distribution, Native Messaging bootstrap, or external CDP features that are not already stable in agent-browser.
+
+`browser.close` detaches the bridge session and does not close the user's desktop Chrome.

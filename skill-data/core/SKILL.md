@@ -220,7 +220,9 @@ Plugins can also provide browser providers, launch mutators such as stealth setu
 
 ```bash
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.

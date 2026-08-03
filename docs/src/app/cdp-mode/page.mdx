@@ -115,6 +115,9 @@ Use the `-p` flag to connect to a cloud browser provider or configured `browser.
 
 ```bash
 agent-browser -p browserbase open https://example.com
+agent-browser -p chrome-extension open https://example.com
 ```
 
-See the [Providers](/providers/browser-use) section for setup and configuration of each built-in provider: [Browser Use](/providers/browser-use), [Browserbase](/providers/browserbase), [Browserless](/providers/browserless), [Kernel](/providers/kernel), and [AgentCore](/providers/agentcore).
+Provider plugins return a CDP WebSocket URL to agent-browser. The optional [Chrome Extension Bridge](/providers/chrome-extension) provider uses that same contract to connect to a local bridge daemon backed by an unpacked MV3 extension.
+
+See the [Providers](/providers/browser-use) section for setup and configuration of each provider: [Browser Use](/providers/browser-use), [Browserbase](/providers/browserbase), [Browserless](/providers/browserless), [Kernel](/providers/kernel), [AgentCore](/providers/agentcore), and [Chrome Extension Bridge](/providers/chrome-extension).

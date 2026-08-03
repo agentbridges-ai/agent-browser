@@ -128,7 +128,7 @@ fn deadline_from(last_sent: Option<Instant>, fps: u32) -> Instant {
 pub(super) async fn accept_loop(
     listener: TcpListener,
     frame_tx: broadcast::Sender<String>,
-    frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
+    frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
@@ -223,7 +223,7 @@ async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     frame_tx: broadcast::Sender<String>,
-    frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
+    frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
@@ -283,7 +283,7 @@ async fn handle_ws_client(
     _addr: SocketAddr,
     initial_config: ClientConfig,
     mut broadcast_rx: broadcast::Receiver<String>,
-    mut frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
+    frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
@@ -327,6 +327,7 @@ async fn handle_ws_client(
     }
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
+    let mut frame_rx = frame_watch.subscribe();
 
     // Watch channels, not atomics, so a mid-stream change wakes the writer's
     // select! below instead of leaving it asleep on a stale deadline.
@@ -383,7 +384,7 @@ async fn handle_ws_client(
 
     // Seed with the newest frame, marked seen so the writer does not re-send
     // it. Charged against the cap, so a URL-declared cap governs the gap after.
-    let initial_frame = frame_watch.borrow_and_update().clone();
+    let initial_frame = frame_rx.borrow_and_update().clone();
     if let Some(frame) = initial_frame {
         if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
             last_sent = Some(Instant::now());
@@ -422,7 +423,7 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            changed = frame_watch.changed(), if !pending_frame => {
+            changed = frame_rx.changed(), if !pending_frame => {
                 if changed.is_err() {
                     break;
                 }
@@ -460,7 +461,7 @@ async fn handle_ws_client(
                 // Invariant: read at send time, not arrival time. That is what
                 // makes this latest-frame-wins; anything that arrived while the
                 // writer waited is skipped rather than queued.
-                let frame = frame_watch.borrow_and_update().clone();
+                let frame = frame_rx.borrow_and_update().clone();
                 pending_frame = false;
                 let cfg = *config_rx.borrow();
                 if let Some(frame) = frame {
@@ -483,13 +484,24 @@ async fn handle_ws_client(
     }
 
     drop(reader_task);
-
-    {
-        let mut count = client_count.lock().await;
-        *count = count.saturating_sub(1);
-    }
+    unregister_stream_client(client_count.as_ref(), &frame_watch).await;
 
     client_notify.notify_one();
+}
+
+/// Unregister one viewer and clear the cached frame before another viewer can
+/// observe a zero-to-one transition. This preserves observer isolation while
+/// using the upstream latest-frame-wins watch channel.
+async fn unregister_stream_client(
+    client_count: &Mutex<usize>,
+    frame_watch: &watch::Sender<Option<Arc<StreamFrame>>>,
+) -> usize {
+    let mut count = client_count.lock().await;
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        frame_watch.send_replace(None);
+    }
+    *count
 }
 
 /// Reads client messages and dispatches them without waiting on frame
@@ -680,6 +692,22 @@ mod tests {
         }
         assert!(!is_user_input_message_type("status"));
         assert!(!is_user_input_message_type("frame"));
+    }
+
+    #[tokio::test]
+    async fn last_viewer_clears_the_cached_frame() {
+        let cached = Arc::new(StreamFrame {
+            seq: Some(1),
+            json: r#"{"type":"frame","seq":1}"#.to_string(),
+        });
+        let (frame_tx, frame_rx) = watch::channel(Some(cached));
+        let client_count = Mutex::new(2usize);
+
+        assert_eq!(unregister_stream_client(&client_count, &frame_tx).await, 1);
+        assert!(frame_rx.borrow().is_some());
+
+        assert_eq!(unregister_stream_client(&client_count, &frame_tx).await, 0);
+        assert!(frame_rx.borrow().is_none());
     }
 
     fn fps_of(msg: serde_json::Value) -> Option<u32> {

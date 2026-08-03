@@ -202,6 +202,11 @@ See [Plugins](/plugins) for the plugin author protocol and implementation exampl
       "capabilities": ["browser.provider"]
     },
     {
+      "name": "chrome-extension",
+      "command": "agent-browser-plugin-chrome-extension",
+      "capabilities": ["browser.provider", "command.run", "chrome-extension.manage"]
+    },
+    {
       "name": "stealth",
       "command": "agent-browser-plugin-stealth",
       "capabilities": ["launch.mutate"]
@@ -223,7 +228,9 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 agent-browser plugin list
 agent-browser auth login my-app --credential-provider vault --item "My App"
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
@@ -253,6 +260,11 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_ARGS</code></td><td>Comma or newline separated browser launch arguments.</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_USER_AGENT</code></td><td>Custom User-Agent string.</td><td>(browser default)</td></tr>
     <tr><td><code>AGENT_BROWSER_PROVIDER</code></td><td>Browser provider such as <code>ios</code>, <code>browserbase</code>, <code>kernel</code>, <code>browseruse</code>, <code>browserless</code>, <code>agentcore</code>, or a configured <code>browser.provider</code> plugin name.</td><td>(local browser)</td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PORT</code></td><td>Local daemon port for the optional Chrome extension bridge provider.</td><td><code>19826</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PROFILE</code></td><td>Profile id to use when multiple Chrome extension bridge profiles are connected.</td><td>Auto-selects one profile when possible</td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_DAEMON</code></td><td>Override daemon executable path for the Chrome extension bridge provider.</td><td>Bundled daemon</td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID</code></td><td>Override the bundled Chrome extension id allowed to connect to the bridge daemon.</td><td><code>pimcamjccpkgapdpecfiadkemnggggbj</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_LOG</code></td><td>Optional daemon log file for the Chrome extension bridge provider.</td><td>No file logging</td></tr>
     <tr><td><code>AGENT_BROWSER_HIDE_SCROLLBARS</code></td><td>Hide native scrollbars in headless Chromium screenshots.</td><td><code>true</code></td></tr>
     <tr><td><code>AGENT_BROWSER_COLOR_SCHEME</code></td><td>Color scheme preference (<code>dark</code>, <code>light</code>, <code>no-preference</code>).</td><td>(none)</td></tr>
     <tr><td><code>AGENT_BROWSER_DOWNLOAD_PATH</code></td><td>Default directory for browser downloads.</td><td>(temp directory)</td></tr>

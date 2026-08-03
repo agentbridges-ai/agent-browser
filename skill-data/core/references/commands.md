@@ -318,6 +318,7 @@ Other capabilities use the same protocol:
 - `browser.provider`: `agent-browser --provider <name> open <url>`
 - `launch.mutate`: append local launch args, extensions, or init scripts
 - `command.run`: `agent-browser plugin run <name> <type> --payload <json>`
+- `chrome-extension.manage`: `agent-browser plugin run chrome-extension chrome-extension.status`
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
@@ -486,6 +487,8 @@ AGENT_BROWSER_HIDE_SCROLLBARS="false"        # Keep native scrollbars visible in
 AGENT_BROWSER_WEBGPU="1"                     # Enable the WebGPU launch preset (see references/webgpu.md)
 AGENT_BROWSER_NO_XVFB="1"                    # Disable automatic Xvfb for headed mode on displayless Linux
 AGENT_BROWSER_PROVIDER="browserbase"         # Browser provider or configured provider plugin
+AGENT_BROWSER_CHROME_BRIDGE_PORT="19826"     # Chrome extension bridge daemon port
+AGENT_BROWSER_CHROME_BRIDGE_PROFILE="..."    # Chrome extension bridge profile id
 AGENT_BROWSER_STREAM_PORT="9223"             # Override WebSocket streaming port (default: OS-assigned)
 AGENT_BROWSER_CONFIG="./agent-browser.json"  # Custom config file
 AGENT_BROWSER_CDP="9222"                     # Connect daemon to CDP port or WebSocket URL

@@ -33,6 +33,7 @@ export const PAGE_TITLES: Record<string, string> = {
   "providers/browser-use": "Browser Use",
   "providers/browserbase": "Browserbase",
   "providers/browserless": "Browserless",
+  "providers/chrome-extension": "Chrome Extension Bridge",
   "providers/kernel": "Kernel",
   changelog: "Changelog",
 };

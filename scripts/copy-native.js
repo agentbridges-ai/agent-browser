@@ -4,7 +4,7 @@
  * Copies the compiled Rust binary to bin/ with platform-specific naming
  */
 
-import { copyFileSync, existsSync, mkdirSync } from 'fs';
+import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { platform, arch } from 'os';
@@ -32,5 +32,21 @@ if (!existsSync(binDir)) {
   mkdirSync(binDir, { recursive: true });
 }
 
-copyFileSync(sourcePath, targetPath);
+// Replacing a Mach-O in place while an existing daemon has it mapped can
+// leave subsequent launches blocked in dyld on macOS. Stage in the same
+// directory and rename atomically so running daemons keep their old inode.
+const stagedPath = `${targetPath}.${process.pid}.tmp`;
+copyFileSync(sourcePath, stagedPath);
+try {
+  renameSync(stagedPath, targetPath);
+} catch (error) {
+  if (platform() !== 'win32') {
+    throw error;
+  }
+  // Windows cannot always replace an existing executable with rename.
+  rmSync(targetPath, { force: true });
+  renameSync(stagedPath, targetPath);
+} finally {
+  rmSync(stagedPath, { force: true });
+}
 console.log(`✓ Copied native binary to ${targetPath}`);

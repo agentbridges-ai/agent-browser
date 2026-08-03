@@ -11,7 +11,9 @@ minimumReleaseAgeExclude:
   - eve
 allowBuilds:
   '@mongodb-js/zstd': false
+  esbuild: true
   msw: false
   node-liblzma: false
   sharp: false
+  spawn-sync: true
   unrs-resolver: false

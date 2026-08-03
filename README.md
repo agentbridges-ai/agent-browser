@@ -802,6 +802,11 @@ Plugins can also be configured manually in `agent-browser.json`:
       "capabilities": ["browser.provider"]
     },
     {
+      "name": "chrome-extension",
+      "command": "agent-browser-plugin-chrome-extension",
+      "capabilities": ["browser.provider", "command.run", "chrome-extension.manage"]
+    },
+    {
       "name": "stealth",
       "command": "agent-browser-plugin-stealth",
       "capabilities": ["launch.mutate"]
@@ -833,6 +838,7 @@ Use a browser provider plugin:
 
 ```bash
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 ```
 
 Use a launch mutator plugin for stealth or local launch customization. The plugin can append Chrome args, extensions, and init scripts before the browser starts:
@@ -845,6 +851,7 @@ Use a generic plugin command for domain-specific tools such as CAPTCHA solvers:
 
 ```bash
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
 The protocol request always includes `protocol`, `type`, `capability`, and `request`. A credential plugin receives `credential.resolve`, a browser provider receives `browser.launch`, a launch mutator receives `launch.mutate`, and generic commands receive the supplied request type. `plugin run` is for `command.run` and custom capabilities; core capabilities and protocol request types use their dedicated command paths. agent-browser keeps browser automation, redaction-sensitive output, and policy enforcement in core.
@@ -854,10 +861,21 @@ Gate plugin access by capability action:
 ```bash
 agent-browser --confirm-actions plugin:vault:credential.read auth login my-app --credential-provider vault --item "My App"
 agent-browser --confirm-actions plugin:cloud-browser:browser.provider --provider cloud-browser open https://example.com
+agent-browser --confirm-actions plugin:chrome-extension:browser.provider --provider chrome-extension open https://example.com
 agent-browser --confirm-actions plugin:stealth:launch.mutate open https://example.com
 ```
 
 Do not put vault tokens or passwords in plugin command args. Use the vault vendor's own login/session mechanism or environment outside agent-browser config.
+
+The optional `@agent-browser/chrome-extension-provider` package adds a `chrome-extension` provider that connects to the user's already running desktop Chrome through an unpacked MV3 extension and local bridge daemon. It is only active when configured as a plugin and selected with `--provider chrome-extension`; default local launch, `--cdp`, `--auto-connect`, and `--profile` behavior are unchanged.
+
+| Variable | Description |
+| -------- | ----------- |
+| `AGENT_BROWSER_CHROME_BRIDGE_PORT` | Local daemon port for the Chrome extension bridge, default `19826` |
+| `AGENT_BROWSER_CHROME_BRIDGE_PROFILE` | Profile id to use when multiple extension profiles are connected |
+| `AGENT_BROWSER_CHROME_BRIDGE_DAEMON` | Override daemon executable path |
+| `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` | Override the bundled extension id allowed to connect |
+| `AGENT_BROWSER_CHROME_BRIDGE_LOG` | Optional daemon log file |
 
 ## Snapshot Options
 
@@ -1830,6 +1848,41 @@ Optional configuration via environment variables:
 **Browser profiles:** When `AGENTCORE_PROFILE_ID` is set, browser state (cookies, localStorage) is persisted across sessions automatically.
 
 When enabled, agent-browser connects to an AgentCore cloud browser session instead of launching a local browser. All commands work identically.
+
+### Chrome Extension Bridge
+
+The optional `@agent-browser/chrome-extension-provider` package connects agent-browser to an already running desktop Chrome profile through an unpacked MV3 extension and a local bridge daemon. The plugin returns a local CDP WebSocket URL, so browser automation, snapshots, policy checks, and output handling remain in agent-browser core.
+
+Build and load the unpacked extension:
+
+```bash
+pnpm --filter @agent-browser/chrome-extension-provider build
+```
+
+Load this directory in Chrome's extension page:
+
+```text
+packages/@agent-browser/chrome-extension-provider/.output/chrome-mv3
+```
+
+Configure the plugin, then use it as a provider:
+
+```bash
+agent-browser --provider chrome-extension open https://example.com
+agent-browser plugin run chrome-extension chrome-extension.status
+```
+
+Optional configuration via environment variables:
+
+| Variable | Description | Default |
+| -------- | ----------- | ------- |
+| `AGENT_BROWSER_CHROME_BRIDGE_PORT` | Local daemon port | `19826` |
+| `AGENT_BROWSER_CHROME_BRIDGE_PROFILE` | Profile id to use when multiple extension profiles are connected | Auto-selects when only one profile is connected |
+| `AGENT_BROWSER_CHROME_BRIDGE_DAEMON` | Override daemon executable path | Bundled daemon |
+| `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` | Override the bundled extension id allowed to connect | `pimcamjccpkgapdpecfiadkemnggggbj` |
+| `AGENT_BROWSER_CHROME_BRIDGE_LOG` | Optional daemon log file | No file logging |
+
+The MVP targets ordinary web pages in desktop Chrome 120 or newer. It does not support `chrome://` pages, browser UI pages, automation of other extension pages, Chrome Web Store distribution, Native Messaging bootstrap, or external CDP features that are not already stable in agent-browser.
 
 ## License
 

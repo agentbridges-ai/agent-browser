@@ -12,6 +12,7 @@ Good plugin fits:
 
 - Resolve login credentials from an external vault
 - Launch a browser through a hosted provider and return a CDP WebSocket URL
+- Connect to a local bridge that returns a CDP WebSocket URL, such as the optional Chrome extension bridge provider
 - Add local Chrome launch arguments, extensions, or init scripts
 - Run a namespaced command such as `captcha.solve`
 
@@ -70,8 +71,10 @@ Then use it through the command path for its capability:
 ```bash
 agent-browser auth login my-app --credential-provider vault --item "My App"
 agent-browser --provider cloud-browser open https://example.com
+agent-browser --provider chrome-extension open https://example.com
 agent-browser open https://example.com
 agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"abc","url":"https://example.com"}'
+agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
 `launch.mutate` plugins run automatically for local launches such as `agent-browser open`.
@@ -88,6 +91,11 @@ agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"abc","url"
       "command": "agent-browser-plugin-vault",
       "args": [],
       "capabilities": ["credential.read"]
+    },
+    {
+      "name": "chrome-extension",
+      "command": "agent-browser-plugin-chrome-extension",
+      "capabilities": ["browser.provider", "command.run", "chrome-extension.manage"]
     },
     {
       "name": "captcha",
@@ -182,10 +190,24 @@ Without a manifest, users must pass `--capability` flags during add.
     <tr><td><code>browser.provider</code></td><td><code>browser.launch</code>, <code>browser.close</code></td><td><code>--provider &lt;name&gt;</code></td><td><code>browser</code></td></tr>
     <tr><td><code>launch.mutate</code></td><td><code>launch.mutate</code></td><td>Any local launch</td><td><code>launch</code></td></tr>
     <tr><td><code>command.run</code></td><td>Custom request type</td><td><code>plugin run &lt;name&gt; &lt;type&gt;</code></td><td><code>data</code></td></tr>
+    <tr><td><code>chrome-extension.manage</code></td><td><code>chrome-extension.status</code></td><td><code>plugin run chrome-extension chrome-extension.status</code></td><td><code>data</code></td></tr>
   </tbody>
 </table>
 
 Plugins may declare custom capabilities such as `captcha.solve`. `plugin run` can invoke `command.run` and custom capabilities, but it cannot invoke core capabilities or protocol request types directly. Use the dedicated command path for `credential.read`, `browser.provider`, and `launch.mutate`.
+
+## Chrome extension bridge provider
+
+The optional `@agent-browser/chrome-extension-provider` package implements a local `browser.provider` plugin named `chrome-extension`. It starts or reuses a local bridge daemon, waits for the unpacked MV3 extension to connect, then returns a CDP WebSocket URL to agent-browser.
+
+```bash
+agent-browser plugin add @agent-browser/chrome-extension-provider --name chrome-extension
+pnpm --filter @agent-browser/chrome-extension-provider build
+agent-browser --provider chrome-extension open https://example.com
+agent-browser plugin run chrome-extension chrome-extension.status
+```
+
+The bridge provider is opt-in. It does not change local Chrome launch, `--cdp`, `--auto-connect`, or `--profile` behavior when the provider is not selected.
 
 ## Minimal plugin
 
