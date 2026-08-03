@@ -80,7 +80,7 @@ The extension connects to port `19826` by default. For a custom port, set `chrom
 
 When a host provides `AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT`, the bridge uses that private route only to find the owning Chrome profile. It does not expose the host tab to the agent. Instead, it creates non-focused task windows and limits the CDP session to tabs created for that session; human takeover focuses the exact controlled tab, and provider cleanup closes session-owned tabs. The Return target is accepted only for an HTTP(S) loopback origin, is sent to the extension only during human control, and stays in the extension worker. The untrusted page receives only a boolean indicating whether the Return button should be shown, never the Nexolyra session path.
 
-True keyboard, mouse, and touch input activates the exact task tab and focuses its Chrome window immediately before dispatch. Read-only observation remains in the background, while input cannot silently land on whichever browser window happened to be frontmost.
+Keyboard, mouse, and touch input activates the exact session-owned task tab immediately before dispatch, while the CDP command remains explicitly addressed to that tab. It does not steal operating-system focus from the user's current app. Human takeover is the separate focus-changing transition and is acknowledged only after Chrome confirms the exact task tab and window.
 
 When Nexolyra owns the daemon lifecycle it starts the process with an internal supervision marker. `/health` exposes that boolean so destructive development harnesses can refuse to restart an unmanaged daemon. The marker is operational metadata, not an authentication mechanism.
 

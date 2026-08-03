@@ -84,7 +84,7 @@ ws://127.0.0.1:19826/devtools/browser/bridge?session=...&token=...
 
 agent-browser sends normal CDP JSON-RPC to that URL. The daemon handles browser-level `Target.*` commands for tabs and forwards page-level CDP commands to the extension. The extension uses `chrome.debugger.attach` and `chrome.debugger.sendCommand` against the selected tab.
 
-Read-only observation can stay in the background. Before true keyboard, mouse, or touch input, the provider activates the exact task tab and confirms that its Chrome window is focused so input cannot silently land on an unrelated window.
+Read-only observation and Agent input can stay in the background. Before keyboard, mouse, or touch input, the provider activates the exact session-owned task tab and sends CDP input explicitly to that tab without stealing operating-system focus. Human takeover is a separate transition and is acknowledged only after Chrome confirms the exact task tab and window.
 
 ## Limits
 

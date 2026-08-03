@@ -672,7 +672,8 @@ ${error.message}`));
 }
 
 async function startFixtureServer() {
-  const main = `<!doctype html>
+  const pages = new Map([
+    ["/", `<!doctype html>
       <title>Bridge E2E</title>
       <script>
         window.__bridgeE2eMouseEvents = [];
@@ -687,12 +688,41 @@ async function startFixtureServer() {
         <label>Name <input id="name" /></label>
         <button id="save" onclick="document.getElementById('result').textContent = 'saved ' + document.getElementById('name').value">Save</button>
         <p id="result" aria-live="polite">pending</p>
-      </main>`;
-  const second = "<!doctype html><title>Second Page</title><h1>Second Page</h1>";
-  const dataUrl = (html) => `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+      </main>`],
+    ["/second", "<!doctype html><title>Second Page</title><h1>Second Page</h1>"],
+  ]);
+  const server = createServer((request, response) => {
+    const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    const page = pages.get(path);
+    if (!page) {
+      response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      response.end("not found");
+      return;
+    }
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-type": "text/html; charset=utf-8",
+    });
+    response.end(page);
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  assert.notEqual(address, null);
+  const origin = `http://127.0.0.1:${address.port}`;
   return {
-    urls: { main: dataUrl(main), second: dataUrl(second) },
-    close: async () => undefined,
+    urls: { main: `${origin}/`, second: `${origin}/second` },
+    close: () =>
+      new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
   };
 }
 

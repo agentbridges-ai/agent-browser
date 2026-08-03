@@ -356,15 +356,19 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     throw new Error(`CDP command ${command.method} is missing tabId`);
   }
   await ensureDebuggerAttached(tabId);
-  if (shouldFocusForInput(command)) {
-    await activateTabAndWindow(tabId);
+  if (shouldActivateForInput(command)) {
+    await activateTabInWindow(tabId);
   }
-  const overlay = controlOverlays.get(tabId);
-  if (overlay) await syncControlOverlay(tabId);
+  // Overlay synchronization is event-driven: initial/phase changes are handled
+  // by Bridge.setControlOverlay and document replacement is handled by the
+  // Page navigation listeners. Re-injecting here would rebuild the closed
+  // shadow tree for every CDP command (including every screencast ACK), making
+  // accessibility handles stale and turning Live into a high-frequency DOM
+  // mutation loop.
   return await debuggerSendCommand({ tabId }, command.method, command.params ?? {});
 }
 
-function shouldFocusForInput(command: BridgeCommand): boolean {
+function shouldActivateForInput(command: BridgeCommand): boolean {
   if (command.method === "Input.insertText") return true;
   const eventType = command.params?.type;
   if (typeof eventType !== "string") return false;
@@ -382,7 +386,7 @@ async function activateTabAndWindow(
   tabId: number,
   knownWindowId?: number,
 ): Promise<chrome.tabs.Tab> {
-  const tab = await tabsUpdate(tabId, { active: true });
+  const tab = await activateTabInWindow(tabId, knownWindowId);
   const windowId = tab.windowId ?? knownWindowId;
   if (windowId === undefined) throw new Error(`Chrome task window is unavailable: ${tabId}`);
   await windowsUpdate(windowId, { focused: true });
@@ -397,6 +401,22 @@ async function activateTabAndWindow(
     await delay(50);
   }
   throw new Error("Chrome did not focus the exact controlled task tab");
+}
+
+async function activateTabInWindow(
+  tabId: number,
+  knownWindowId?: number,
+): Promise<chrome.tabs.Tab> {
+  let tab = await tabsUpdate(tabId, { active: true });
+  const windowId = tab.windowId ?? knownWindowId;
+  if (windowId === undefined) throw new Error(`Chrome task window is unavailable: ${tabId}`);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const [activeTab] = await tabsQuery({ active: true, windowId });
+    if (activeTab?.id === tabId) return tab;
+    if (attempt === 4) tab = await tabsUpdate(tabId, { active: true });
+    await delay(25);
+  }
+  throw new Error("Chrome did not activate the exact controlled task tab");
 }
 
 function delay(ms: number): Promise<void> {
