@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
-import { parseExtensionId } from "../dist/config.js";
+import { parseExtensionId, readBridgeConfig } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 
 test("extension allowlist configuration accepts only canonical Chrome ids", () => {
@@ -15,6 +15,82 @@ test("extension allowlist configuration accepts only canonical Chrome ids", () =
     "pimcamjccpkgapdpecfiadkemnggggbj",
   );
   assert.throws(() => parseExtensionId("extension-id"), /32-character Chrome extension id/);
+});
+
+test("daemon state defaults to the fixed agent-browser user directory", () => {
+  const expected = join(
+    homedir(),
+    ".agent-browser",
+    "chrome-extension-provider",
+    "19826",
+    "sessions.json",
+  );
+  assert.equal(readBridgeConfig({}).statePath, expected);
+  assert.equal(
+    readBridgeConfig({ AGENT_BROWSER_CHROME_BRIDGE_LOG: "/tmp/custom-bridge.log" }).statePath,
+    expected,
+  );
+  assert.equal(
+    readBridgeConfig({ AGENT_BROWSER_CHROME_BRIDGE_STATE: "/tmp/explicit-state.json" }).statePath,
+    "/tmp/explicit-state.json",
+  );
+  assert.deepEqual(readBridgeConfig({ AGENT_BROWSER_CHROME_BRIDGE_STATE: "/tmp/explicit-state.json" }).legacyStatePaths, []);
+  assert.deepEqual(
+    readBridgeConfig({ AGENT_BROWSER_CHROME_BRIDGE_LOG: "/tmp/legacy/bridge.log" })
+      .legacyStatePaths,
+    ["/tmp/legacy/sessions.json"],
+  );
+  assert.equal(
+    readBridgeConfig({ AGENT_BROWSER_CHROME_BRIDGE_PORT: "19827" }).statePath,
+    join(homedir(), ".agent-browser", "chrome-extension-provider", "19827", "sessions.json"),
+  );
+});
+
+test("daemon atomically migrates a valid legacy state file to the fixed state path", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-state-migration-"));
+  const legacyStatePath = join(root, "legacy", "sessions.json");
+  const statePath = join(root, "fixed", "sessions.json");
+  mkdirSync(join(root, "legacy"), { recursive: true });
+  writeFileSync(
+    legacyStatePath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      sessions: [
+        {
+          schemaVersion: 1,
+          session: {
+            sessionId: "legacy-session",
+            token: "legacy-token",
+            ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+            createdAt: new Date().toISOString(),
+          },
+          control: {
+            phase: "agent",
+            epoch: 2,
+            updatedAt: new Date().toISOString(),
+          },
+          targetIds: [],
+          savedAt: new Date().toISOString(),
+        },
+      ],
+    })}\n`,
+    { encoding: "utf8" },
+  );
+  const daemon = new BridgeDaemon({
+    port: await freePort(),
+    statePath,
+    legacyStatePaths: [legacyStatePath],
+  });
+
+  try {
+    assert.equal(daemon.status().sessions[0].sessionId, "legacy-session");
+    assert.equal(daemon.status().sessions[0].control.phase, "detached");
+    assert.equal(existsSync(statePath), true);
+    assert.equal(existsSync(legacyStatePath), false);
+  } finally {
+    await daemon.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("daemon validates CDP tokens and routes core CDP traffic through the extension bridge", async () => {
@@ -118,6 +194,102 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
     assert.deepEqual(closed.result, {});
 
     cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("daemon prevents another bridge session from attaching an already controlled tab", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const ownerSession = await postJson(port, "/sessions", {});
+    const otherSession = await postJson(port, "/sessions", {});
+    const ownerCdp = await connectCdp(port, ownerSession.sessionId, ownerSession.token);
+    const otherCdp = await connectCdp(port, otherSession.sessionId, otherSession.token);
+
+    const ownerAttachment = await cdpCommand(ownerCdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    assert.match(ownerAttachment.result.sessionId, /^session:/);
+
+    const rejected = await cdpCommand(otherCdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    assert.match(rejected.error.message, /already controlled by another session/);
+
+    const implicitRejected = await cdpCommand(otherCdp, {
+      id: 20,
+      method: "Runtime.evaluate",
+      params: { expression: "document.title" },
+    });
+    assert.match(implicitRejected.error.message, /already controlled by another session/);
+
+    const stolenAttachmentRejected = await cdpCommand(otherCdp, {
+      id: 21,
+      sessionId: ownerAttachment.result.sessionId,
+      method: "Runtime.evaluate",
+      params: { expression: "document.title" },
+    });
+    assert.match(stolenAttachmentRejected.error.message, /belongs to another bridge session/);
+
+    const closeRejected = await cdpCommand(otherCdp, {
+      id: 22,
+      method: "Target.closeTarget",
+      params: { targetId: "tab:profile-a:101" },
+    });
+    assert.match(closeRejected.error.message, /already controlled by another session/);
+
+    const activateRejected = await cdpCommand(otherCdp, {
+      id: 23,
+      method: "Target.activateTarget",
+      params: { targetId: "tab:profile-a:101" },
+    });
+    assert.match(activateRejected.error.message, /already controlled by another session/);
+
+    const sameOwnerAttachment = await cdpCommand(ownerCdp, {
+      id: 3,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    assert.match(sameOwnerAttachment.result.sessionId, /^session:/);
+    assert.notEqual(sameOwnerAttachment.result.sessionId, ownerAttachment.result.sessionId);
+
+    ownerCdp.close();
+    await new Promise((resolve) => ownerCdp.once("close", resolve));
+    const reconnectedOwnerCdp = await connectCdp(
+      port,
+      ownerSession.sessionId,
+      ownerSession.token,
+    );
+    const retainedAfterTransportReconnect = await cdpCommand(reconnectedOwnerCdp, {
+      id: 4,
+      sessionId: ownerAttachment.result.sessionId,
+      method: "Runtime.evaluate",
+      params: { expression: "document.title" },
+    });
+    assert.equal(retainedAfterTransportReconnect.error, undefined);
+
+    await postJson(port, `/sessions/${ownerSession.sessionId}/detach`, {});
+    const releasedAfterLifecycleDetach = await cdpCommand(otherCdp, {
+      id: 5,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    assert.match(releasedAfterLifecycleDetach.result.sessionId, /^session:/);
+
+    reconnectedOwnerCdp.close();
+    otherCdp.close();
   } finally {
     extension.close();
     await daemon.stop();

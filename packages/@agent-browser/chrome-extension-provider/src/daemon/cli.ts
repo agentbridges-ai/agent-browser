@@ -8,6 +8,7 @@ const daemon = new BridgeDaemon({
   allowedExtensionId: config.extensionId,
   logPath: config.logPath,
   statePath: config.statePath,
+  legacyStatePaths: config.legacyStatePaths,
   supervisedByNexolyra: config.supervisedByNexolyra,
 });
 

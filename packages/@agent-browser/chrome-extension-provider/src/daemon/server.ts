@@ -43,6 +43,7 @@ export type BridgeDaemonOptions = {
   commandTimeoutMs?: number;
   detachedTargetGraceMs?: number;
   statePath?: string;
+  legacyStatePaths?: string[];
   sessionRetentionMs?: number;
   supervisedByNexolyra?: boolean;
 };
@@ -376,10 +377,14 @@ export class BridgeDaemon {
 
   private loadPersistedSessions(): void {
     const statePath = this.options.statePath;
-    if (!statePath || !existsSync(statePath)) return;
+    if (!statePath) return;
+    const sourcePath = existsSync(statePath)
+      ? statePath
+      : this.options.legacyStatePaths?.find((candidate) => existsSync(candidate));
+    if (!sourcePath) return;
     let persisted: PersistedBridgeState;
     try {
-      persisted = JSON.parse(readFileSync(statePath, "utf8")) as PersistedBridgeState;
+      persisted = JSON.parse(readFileSync(sourcePath, "utf8")) as PersistedBridgeState;
     } catch {
       return;
     }
@@ -452,6 +457,7 @@ export class BridgeDaemon {
       });
     }
     this.persistSessions();
+    if (sourcePath !== statePath) rmSync(sourcePath, { force: true });
   }
 
   private persistSessions(): void {
@@ -922,6 +928,7 @@ export class BridgeDaemon {
       const peer = this.profiles.get(ref.profileId);
       if (!peer || !peer.tabs.has(ref.tabId))
         throw new Error(`Target is not available: ${targetId}`);
+      this.assertTabAvailableToSession(bridgeSession, ref.profileId, ref.tabId);
       const sessionId = sessionIdFor(ref.tabId, this.attachSequence++);
       this.attachedSessions.set(sessionId, {
         sessionId,
@@ -940,6 +947,11 @@ export class BridgeDaemon {
       const targetId = stringParam(request.params, "targetId");
       this.assertTargetAllowed(bridgeSession, targetId);
       const peerAndTab = this.peerAndTabFromTargetId(targetId);
+      this.assertTabAvailableToSession(
+        bridgeSession,
+        peerAndTab.peer.profileId,
+        peerAndTab.tab.tabId,
+      );
       await this.sendBridgeCommand(peerAndTab.peer, {
         method: "Bridge.activateTab",
         params: { tabId: peerAndTab.tab.tabId },
@@ -952,6 +964,11 @@ export class BridgeDaemon {
       const targetId = stringParam(request.params, "targetId");
       this.assertTargetAllowed(bridgeSession, targetId);
       const peerAndTab = this.peerAndTabFromTargetId(targetId);
+      this.assertTabAvailableToSession(
+        bridgeSession,
+        peerAndTab.peer.profileId,
+        peerAndTab.tab.tabId,
+      );
       await this.sendBridgeCommand(peerAndTab.peer, {
         method: "Bridge.closeTab",
         params: { tabId: peerAndTab.tab.tabId },
@@ -979,6 +996,7 @@ export class BridgeDaemon {
       const activeTab =
         tabs.find((tab) => tab.active && shouldExposeTab(tab)) ?? tabs.find(shouldExposeTab);
       if (!activeTab) throw new Error("No automatable tab is available");
+      this.assertTabAvailableToSession(bridgeSession, peer.profileId, activeTab.tabId);
       const sessionId = sessionIdFor(activeTab.tabId, this.attachSequence++);
       this.attachedSessions.set(sessionId, {
         sessionId,
@@ -994,6 +1012,9 @@ export class BridgeDaemon {
     }
     const session = this.attachedSessions.get(request.sessionId as string);
     if (!session) throw new Error(`Unknown sessionId: ${request.sessionId}`);
+    if (session.bridgeSessionId !== bridgeSession.sessionId) {
+      throw new Error("The CDP attachment belongs to another bridge session");
+    }
     const peer = this.profiles.get(session.profileId);
     if (!peer) throw new Error(`Profile is offline: ${session.profileId}`);
     const captureParams = request.params ?? {};
@@ -1606,6 +1627,22 @@ export class BridgeDaemon {
       if (session.profileId === profileId && session.tabId === tabId) return true;
     }
     return false;
+  }
+
+  private assertTabAvailableToSession(
+    bridgeSession: BridgeSession,
+    profileId: string,
+    tabId: number,
+  ): void {
+    for (const attached of this.attachedSessions.values()) {
+      if (
+        attached.profileId === profileId &&
+        attached.tabId === tabId &&
+        attached.bridgeSessionId !== bridgeSession.sessionId
+      ) {
+        throw new Error("The requested Chrome tab is already controlled by another session");
+      }
+    }
   }
 
   private markTabActive(peer: ProfilePeer, activeTab: BridgeTab): void {

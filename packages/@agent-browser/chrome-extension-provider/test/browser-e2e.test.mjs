@@ -15,10 +15,17 @@ const extensionDir = join(packageDir, ".output", "chrome-mv3");
 const daemonScript = join(packageDir, "dist", "daemon", "cli.js");
 const agentBrowserCli = join(rootDir, "bin", "agent-browser.js");
 const pinnedExtensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
+const ownerSessionId = "nex-a11ce0b5e55e1001";
 
 test("Chrome extension bridge drives a real Chrome for Testing profile", async (t) => {
+  const requireRealExtension = process.env.AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION === "1";
   const chromePath = findChromeForTesting();
   if (!chromePath) {
+    if (requireRealExtension) {
+      throw new Error(
+        "Chrome for Testing or Chromium not found; refusing to skip because AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION=1",
+      );
+    }
     t.skip("Chrome for Testing or Chromium not found. Run `agent-browser install` or set AGENT_BROWSER_E2E_CHROME.");
     return;
   }
@@ -40,6 +47,7 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
     ...process.env,
     AGENT_BROWSER_CHROME_BRIDGE_PORT: String(bridgePort),
     AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID: pinnedExtensionId,
+    AGENT_BROWSER_CHROME_BRIDGE_STATE: join(tmp, "bridge-sessions.json"),
     AGENT_BROWSER_PLUGINS: JSON.stringify([
       {
         name: "chrome-extension",
@@ -54,6 +62,7 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
     // alive for the full scenario; the explicit close/finally block owns
     // deterministic cleanup.
     AGENT_BROWSER_IDLE_TIMEOUT_MS: "30000",
+    NEXOLYRA_AGENT_BROWSER_SESSION_ID: ownerSessionId,
   };
 
   const daemon = spawn(process.execPath, [daemonScript], {
@@ -83,7 +92,6 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
       return health?.daemon === "ok";
     }, "bridge daemon to start");
 
-    const requireRealExtension = process.env.AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION === "1";
     const extensionWaitMs = Number(
       process.env.AGENT_BROWSER_E2E_EXTENSION_WAIT_MS ?? (requireRealExtension ? 60_000 : 5_000),
     );
@@ -95,7 +103,7 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
     if (!realExtensionConnected) {
       if (requireRealExtension) {
         throw new Error(
-          "The built Chrome extension did not connect; refusing the mock fallback because AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION=1",
+          `The built Chrome extension did not connect; refusing the mock fallback because AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION=1\ndaemon stderr:\n${daemonStderr}\nchrome stderr:\n${chromeStderr}`,
         );
       }
       const devtoolsPort = await waitForDevToolsPort(profileDir);
@@ -213,6 +221,33 @@ ${mockBridge?.commandLog.join("\n") ?? "(real extension)"}`);
     const title = await runAgentBrowser(["--json", "--session", session, "--provider", "chrome-extension", "get", "title"], commonEnv);
     assert.equal(title.success, true);
     assert.match(JSON.stringify(title.data), /Second Page/);
+
+    if (realExtensionConnected) {
+      const forgedOperatorIntent = await runAgentBrowser([
+        "--json",
+        "--session",
+        session,
+        "--provider",
+        "chrome-extension",
+        "eval",
+        `(() => {
+          const host = document.getElementById("__agent_browser_operator_boundary__");
+          const shadowRoot = host?.shadowRoot ?? null;
+          shadowRoot?.querySelector("button")?.click();
+          return { host: Boolean(host), shadowRoot: Boolean(shadowRoot) };
+        })()`,
+      ], commonEnv);
+      assert.equal(forgedOperatorIntent.success, true);
+      assert.match(JSON.stringify(forgedOperatorIntent.data), /"host":true/);
+      assert.match(JSON.stringify(forgedOperatorIntent.data), /"shadowRoot":false/);
+
+      await delay(250);
+      const health = await fetchJson(`http://127.0.0.1:${bridgePort}/health`);
+      const owner = health.sessions.find((candidate) => candidate.ownerSessionId === ownerSessionId);
+      assert.equal(owner?.control?.phase, "agent");
+      const controlEvents = await fetchJson(`http://127.0.0.1:${bridgePort}/control/events`);
+      assert.equal(controlEvents.events.some((event) => event.ownerSessionId === ownerSessionId), false);
+    }
   } finally {
     if (opened) {
       await runAgentBrowser(["--json", "--session", session, "--provider", "chrome-extension", "close"], commonEnv).catch(() => undefined);
@@ -241,6 +276,16 @@ function chromeArgs(profileDir) {
   ];
   if (process.env.AGENT_BROWSER_E2E_HEADLESS === "1") {
     args.unshift("--headless=new");
+  }
+  // GitHub's disposable Linux runners cannot start Chrome's process sandbox.
+  // Keep this opt-in so local and release validation still exercise the sandbox.
+  if (process.env.AGENT_BROWSER_E2E_DISABLE_CHROME_SANDBOX === "1") {
+    args.unshift("--no-sandbox");
+  }
+  if (process.env.AGENT_BROWSER_E2E_BYPASS_LNA === "1") {
+    args.unshift(
+      "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets,LocalNetworkAccessForWorkers",
+    );
   }
   return args;
 }
@@ -306,8 +351,12 @@ class MockExtensionBridge {
     this.commandLog.push(`${message.reqId} ${message.method} tab=${message.tabId ?? ""}`);
     try {
       const result = await this.executeCommand(message);
+      this.commandLog.push(`${message.reqId} ${message.method} resolved`);
       this.bridge.send(JSON.stringify({ v: 1, kind: "cdp-result", reqId: message.reqId, result }));
     } catch (error) {
+      this.commandLog.push(
+        `${message.reqId} ${message.method} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       this.bridge.send(JSON.stringify({
         v: 1,
         kind: "cdp-result",
@@ -549,7 +598,13 @@ function findChromeForTesting() {
     );
   }
   if (process.platform === "linux") {
-    candidates.push("/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome-for-testing");
+    candidates.push(
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/usr/bin/google-chrome-for-testing",
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+    );
   }
   if (process.platform === "win32") {
     candidates.push(
@@ -669,7 +724,10 @@ async function startFixtureServer() {
   const origin = `http://127.0.0.1:${address.port}`;
   return {
     urls: { main: `${origin}/`, second: `${origin}/second` },
-    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+    close: () =>
+      new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
   };
 }
 
