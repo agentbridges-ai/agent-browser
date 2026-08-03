@@ -277,6 +277,11 @@ function chromeArgs(profileDir) {
   if (process.env.AGENT_BROWSER_E2E_HEADLESS === "1") {
     args.unshift("--headless=new");
   }
+  // GitHub's disposable Linux runners cannot start Chrome's process sandbox.
+  // Keep this opt-in so local and release validation still exercise the sandbox.
+  if (process.env.AGENT_BROWSER_E2E_DISABLE_CHROME_SANDBOX === "1") {
+    args.unshift("--no-sandbox");
+  }
   if (process.env.AGENT_BROWSER_E2E_BYPASS_LNA === "1") {
     args.unshift(
       "--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets,LocalNetworkAccessForWorkers",

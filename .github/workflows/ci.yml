@@ -154,6 +154,7 @@ jobs:
         env:
           AGENT_BROWSER_E2E_CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
           AGENT_BROWSER_E2E_BYPASS_LNA: "1"
+          AGENT_BROWSER_E2E_DISABLE_CHROME_SANDBOX: "1"
           AGENT_BROWSER_E2E_HEADLESS: "1"
           AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION: "1"
         run: pnpm --filter @agent-browser/chrome-extension-provider test:browser-e2e
