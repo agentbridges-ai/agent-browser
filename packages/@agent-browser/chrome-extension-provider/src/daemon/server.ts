@@ -89,7 +89,7 @@ type PendingCommand = {
   bridgeSessionId?: string;
 };
 
-type ControlPhase = "agent" | "human" | "detached" | "stopped";
+type ControlPhase = "agent" | "human" | "detached" | "resuming" | "stopped";
 
 type ControlState = {
   phase: ControlPhase;
@@ -581,8 +581,15 @@ export class BridgeDaemon {
       }
       const body = await readJsonBody(req);
       const phase = body.phase;
-      if (phase !== "agent" && phase !== "human" && phase !== "stopped") {
-        this.writeJson(res, 400, { error: "phase must be agent, human, or stopped" });
+      if (
+        phase !== "agent" &&
+        phase !== "human" &&
+        phase !== "resuming" &&
+        phase !== "stopped"
+      ) {
+        this.writeJson(res, 400, {
+          error: "phase must be agent, human, resuming, or stopped",
+        });
         return;
       }
       try {
@@ -936,7 +943,6 @@ export class BridgeDaemon {
       return { handled: true, result: { targetId } };
     }
     if (method === "Target.attachToTarget") {
-      this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
       if (!targetId) throw new Error("Target.attachToTarget requires targetId");
       this.assertTargetAllowed(bridgeSession, targetId);
@@ -945,6 +951,20 @@ export class BridgeDaemon {
       const peer = this.profiles.get(ref.profileId);
       if (!peer || !peer.tabs.has(ref.tabId))
         throw new Error(`Target is not available: ${targetId}`);
+      const control = this.controlStates.get(bridgeSession.sessionId);
+      if (control?.phase === "resuming") {
+        const existing = [...this.attachedSessions.values()].find(
+          (entry) =>
+            entry.bridgeSessionId === bridgeSession.sessionId &&
+            entry.profileId === ref.profileId &&
+            entry.tabId === ref.tabId,
+        );
+        if (!existing) {
+          throw new Error("Semantic readback can attach only to the reconnected task tab");
+        }
+        return { handled: true, result: { sessionId: existing.sessionId } };
+      }
+      this.assertAgentControl(bridgeSession);
       this.assertTabAvailableToSession(bridgeSession, ref.profileId, ref.tabId);
       const sessionId = sessionIdFor(ref.tabId, this.attachSequence++);
       this.attachedSessions.set(sessionId, {
@@ -1005,7 +1025,7 @@ export class BridgeDaemon {
       this.sendCdpResult(ws, request.id as number, {});
       return;
     }
-    this.assertControlAllows(bridgeSession, request.method as string);
+    this.assertControlAllows(bridgeSession, request.method as string, request.params);
     const attached = request.sessionId ? this.attachedSessions.get(request.sessionId) : undefined;
     if (!attached) {
       const peer = this.selectProfile(bridgeSession);
@@ -1058,10 +1078,17 @@ export class BridgeDaemon {
     this.assertControlAllows(session, "");
   }
 
-  private assertControlAllows(session: BridgeSession, method: string): void {
+  private assertControlAllows(
+    session: BridgeSession,
+    method: string,
+    params?: Record<string, unknown>,
+  ): void {
     const state = this.controlStates.get(session.sessionId);
     if (state?.phase === "human" && !isObserverCdpMethod(method)) {
       throw new Error("Browser control is held by the user");
+    }
+    if (state?.phase === "resuming" && !isSemanticReadbackCdpRequest(method, params)) {
+      throw new Error("Browser control is resuming with semantic readback only");
     }
     if (
       state?.phase === "stopped" &&
@@ -1373,15 +1400,22 @@ export class BridgeDaemon {
       (attached) => attached.bridgeSessionId === session.sessionId,
     );
     if (existing) {
+      const existingTargetId = targetIdFor(existing.profileId, existing.tabId);
+      if (requestedTargetId && requestedTargetId !== existingTargetId) {
+        throw new Error(
+          "The browser session is already attached to a different reconnect target",
+        );
+      }
+      await this.setBridgeControl(session, "resuming");
       return {
         matched: sessions.length,
         attached: true,
-        targetId: targetIdFor(existing.profileId, existing.tabId),
+        targetId: existingTargetId,
         sessionId: existing.sessionId,
         profileId: existing.profileId,
       };
     }
-    const target = this.resolveReconnectTarget(session, requestedTargetId);
+    const target = this.resolveReconnectTarget(requestedTargetId);
     if (this.hasAttachedSession(target.peer.profileId, target.tab.tabId)) {
       throw new Error("The requested Chrome tab is already controlled by another session");
     }
@@ -1391,7 +1425,7 @@ export class BridgeDaemon {
     const attachedSessionId =
       previous?.sessionId ?? sessionIdFor(target.tab.tabId, this.attachSequence++);
     try {
-      await this.setBridgeControl(session, "agent");
+      await this.setBridgeControl(session, "resuming");
       this.attachedSessions.set(attachedSessionId, {
         sessionId: attachedSessionId,
         bridgeSessionId: session.sessionId,
@@ -1434,7 +1468,6 @@ export class BridgeDaemon {
   }
 
   private resolveReconnectTarget(
-    session: BridgeSession,
     requestedTargetId?: string,
   ): { targetId: string; peer: ProfilePeer; tab: BridgeTab } {
     if (requestedTargetId) {
@@ -1447,29 +1480,9 @@ export class BridgeDaemon {
       }
       return { targetId: requestedTargetId, peer, tab };
     }
-    const peers = session.profileId
-      ? [this.profiles.get(session.profileId)].filter((peer): peer is ProfilePeer => Boolean(peer))
-      : [...this.profiles.values()];
-    const candidates = peers.flatMap((peer) =>
-      [...peer.tabs.values()]
-        .filter(
-          (tab) =>
-            shouldExposeTab(tab) &&
-            (!session.profileUrlHint || tabMatchesProfileUrlHint(tab, session.profileUrlHint)),
-        )
-        .map((tab) => ({ peer, tab, targetId: targetIdFor(peer.profileId, tab.tabId) })),
+    throw new Error(
+      "Reconnect requires an explicit targetId unless the task tab is already attached",
     );
-    if (candidates.length === 1) return candidates[0];
-    const active = candidates.filter(({ tab }) => tab.active);
-    if (active.length === 1) return active[0];
-    if (candidates.length === 0) {
-      throw new Error(
-        session.profileUrlHint
-          ? "The Nexolyra session tab is not available; provide an explicit reconnect target"
-          : "No reconnectable Chrome tab is available",
-      );
-    }
-    throw new Error("Reconnect requires an explicit targetId because multiple Chrome tabs match");
   }
 
   private async setOwnerControl(
@@ -1637,6 +1650,8 @@ export class BridgeDaemon {
         cdpError(
             phase === "human"
               ? "Browser control was taken over by the user"
+              : phase === "resuming"
+                ? "Browser control is resuming with semantic readback only"
               : phase === "detached"
                 ? "Browser control was detached from Chrome"
                 : "Browser control was stopped",
@@ -2097,6 +2112,32 @@ function isObserverCdpMethod(method: string): boolean {
     method === "Page.screencastFrameAck" ||
     method === "Page.captureScreenshot"
   );
+}
+
+/**
+ * Provider-side fence for the handoff measurement window. The native
+ * `snapshot --readback-only` path intentionally uses only this small set.
+ * In particular, general Runtime.evaluate remains blocked; the lone `1`
+ * expression is the browser manager's bounded renderer-liveness probe.
+ */
+function isSemanticReadbackCdpRequest(
+  method: string,
+  params?: Record<string, unknown>,
+): boolean {
+  if (isObserverCdpMethod(method)) return true;
+  if (
+    method === "Page.enable" ||
+    method === "Runtime.enable" ||
+    method === "Runtime.runIfWaitingForDebugger" ||
+    method === "Network.enable" ||
+    method === "DOM.enable" ||
+    method === "Accessibility.enable" ||
+    method === "Accessibility.getFullAXTree" ||
+    method === "DOM.describeNode"
+  ) {
+    return true;
+  }
+  return method === "Runtime.evaluate" && params?.expression === "1";
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {

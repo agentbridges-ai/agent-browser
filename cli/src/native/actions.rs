@@ -4572,16 +4572,24 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
 async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let readback_only = cmd
+        .get("readbackOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let options = SnapshotOptions {
-        selector: cmd
-            .get("selector")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        interactive: cmd
-            .get("interactive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        selector: if readback_only {
+            None
+        } else {
+            cmd.get("selector")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        },
+        interactive: !readback_only
+            && cmd
+                .get("interactive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         compact: cmd
             .get("compact")
             .and_then(|v| v.as_bool())
@@ -4590,7 +4598,8 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             .get("maxDepth")
             .and_then(|v| v.as_u64())
             .map(|d| d as usize),
-        urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
+        urls: !readback_only && cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
+        readback_only,
     };
 
     state.ref_map.clear();
@@ -4604,7 +4613,13 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     )
     .await?;
 
-    let url = mgr.get_url().await.unwrap_or_default();
+    // Runtime.evaluate is intentionally excluded from the ownership handoff
+    // measurement channel. The caller consumes only the semantic snapshot.
+    let url = if readback_only {
+        String::new()
+    } else {
+        mgr.get_url().await.unwrap_or_default()
+    };
 
     let refs: serde_json::Map<String, Value> = state
         .ref_map

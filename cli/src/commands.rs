@@ -876,6 +876,13 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "-u" | "--urls" => {
                         obj.insert("urls".to_string(), json!(true));
                     }
+                    // Internal control-plane mode used by Nexolyra while the
+                    // provider is fenced in `resuming`. It deliberately
+                    // produces an Accessibility-only snapshot so the
+                    // readback gate never needs general Runtime.evaluate.
+                    "--readback-only" => {
+                        obj.insert("readbackOnly".to_string(), json!(true));
+                    }
                     "-d" | "--depth" => {
                         if let Some(d) = rest.get(i + 1) {
                             if let Ok(n) = d.parse::<i32>() {
@@ -4447,6 +4454,13 @@ mod tests {
         let cmd = parse_command(&args("snapshot -i -u"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "snapshot");
         assert_eq!(cmd["urls"], true);
+    }
+
+    #[test]
+    fn test_snapshot_readback_only() {
+        let cmd = parse_command(&args("snapshot --readback-only"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "snapshot");
+        assert_eq!(cmd["readbackOnly"], true);
     }
 
     // === Wait ===
