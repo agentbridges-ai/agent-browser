@@ -20,6 +20,8 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 pub(crate) const INTERNAL_DAEMON_SHUTDOWN_ACTION: &str = "__agent_browser_internal_shutdown";
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Serialize)]
 #[allow(dead_code)]
@@ -780,6 +782,19 @@ fn stop_existing_daemon_for_restart(session: &str) {
     }
 }
 
+fn terminate_timed_out_daemon(session: &str, child: Option<&mut std::process::Child>) -> String {
+    let mut stderr_output = String::new();
+    if let Some(child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut stderr_output);
+        }
+    }
+    cleanup_stale_files(session);
+    stderr_output
+}
+
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
     let mut restarted = false;
 
@@ -908,7 +923,8 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
     let spawned_pid = daemon_child.as_ref().map(|child| child.id());
 
-    for _ in 0..50 {
+    let startup_started = Instant::now();
+    while startup_started.elapsed() < DAEMON_STARTUP_TIMEOUT {
         if daemon_ready(session) {
             if let Some(result) = ready_spawned_daemon_result(session, opts, spawned_pid, restarted)
             {
@@ -970,8 +986,15 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
             }
         }
 
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(DAEMON_STARTUP_POLL_INTERVAL);
     }
+
+    // A provider-backed daemon may need several seconds to create and attach
+    // its first browser target. If that bounded startup still expires, kill
+    // the exact child we spawned before returning. Leaving it detached lets a
+    // late socket appear after the caller has already failed and can leak a
+    // daemon into the next session or test run.
+    let startup_stderr = terminate_timed_out_daemon(session, daemon_child.as_mut());
 
     #[cfg(unix)]
     let endpoint_info = format!(
@@ -981,7 +1004,30 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     #[cfg(windows)]
     let endpoint_info = format!("port: 127.0.0.1:{}", resolve_port(session));
 
-    Err(format!("Daemon failed to start ({})", endpoint_info))
+    let stderr_detail = startup_stderr.trim();
+    if stderr_detail.is_empty() {
+        Err(format!(
+            "Daemon failed to start within {}s ({})",
+            DAEMON_STARTUP_TIMEOUT.as_secs(),
+            endpoint_info
+        ))
+    } else {
+        let detail = if stderr_detail.len() > 500 {
+            let mut end = 500;
+            while !stderr_detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            &stderr_detail[..end]
+        } else {
+            stderr_detail
+        };
+        Err(format!(
+            "Daemon failed to start within {}s ({}):\n{}",
+            DAEMON_STARTUP_TIMEOUT.as_secs(),
+            endpoint_info,
+            detail
+        ))
+    }
 }
 
 fn connect(session: &str) -> Result<Connection, String> {
@@ -1388,6 +1434,39 @@ mod tests {
         assert!(!result.already_running);
         assert!(result.restarted);
         assert!(daemon_config_matches(session, &opts));
+    }
+
+    #[test]
+    fn test_daemon_startup_budget_covers_slow_provider_attachment() {
+        assert!(DAEMON_STARTUP_TIMEOUT >= Duration::from_secs(15));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_timed_out_startup_kills_child_and_removes_runtime_files() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "timed-out-startup";
+        fs::write(get_pid_path(session), "12345").unwrap();
+        fs::write(get_version_path(session), env!("CARGO_PKG_VERSION")).unwrap();
+        fs::write(get_config_path(session), "stale").unwrap();
+
+        let mut child = Command::new("sh")
+            .args(["-c", "printf startup-timeout >&2; sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _stderr = terminate_timed_out_daemon(session, Some(&mut child));
+
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!get_pid_path(session).exists());
+        assert!(!get_version_path(session).exists());
+        assert!(!get_config_path(session).exists());
     }
 
     // === Transient Error Detection Tests ===

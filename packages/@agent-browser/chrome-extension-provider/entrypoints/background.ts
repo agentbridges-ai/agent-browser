@@ -30,6 +30,11 @@ type ControlOverlay = {
 const controlOverlays = new Map<number, ControlOverlay>();
 const controlBindingTabs = new Set<number>();
 const controlOverlaySyncs = new Map<number, Promise<void>>();
+// Retain only browser-authored opener edges for the lifetime of each child.
+// The onCreated payload can carry the edge before a later tabs snapshot. If
+// the worker restarts, the edge is deliberately lost and ownership fails
+// closed instead of being reconstructed from URLs, timing, or adjacency.
+const observedTabOpeners = new Map<number, number>();
 let bridge: WebSocket | null = null;
 let activePort = DEFAULT_PORT;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -86,7 +91,12 @@ export default defineBackground(() => {
     }
     return false;
   });
-  chrome.tabs.onCreated.addListener(() => scheduleHeartbeat());
+  chrome.tabs.onCreated.addListener((tab) => {
+    if (typeof tab.id === "number" && typeof tab.openerTabId === "number") {
+      observedTabOpeners.set(tab.id, tab.openerTabId);
+    }
+    scheduleHeartbeat();
+  });
   chrome.tabs.onUpdated.addListener(() => scheduleHeartbeat());
   chrome.tabs.onActivated.addListener(() => scheduleHeartbeat());
   chrome.windows.onFocusChanged.addListener(() => scheduleHeartbeat());
@@ -99,6 +109,7 @@ export default defineBackground(() => {
     controlOverlays.delete(tabId);
     controlBindingTabs.delete(tabId);
     controlOverlaySyncs.delete(tabId);
+    observedTabOpeners.delete(tabId);
     scheduleHeartbeat();
   });
   chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -751,9 +762,11 @@ async function allTabs(): Promise<BridgeTab[]> {
 }
 
 function tabToBridgeTab(tab: chrome.tabs.Tab): BridgeTab {
+  const openerTabId =
+    tab.openerTabId ?? (typeof tab.id === "number" ? observedTabOpeners.get(tab.id) : undefined);
   return {
     tabId: tab.id ?? -1,
-    openerTabId: tab.openerTabId,
+    openerTabId,
     windowId: tab.windowId,
     url: tab.url ?? "",
     title: tab.title ?? "",

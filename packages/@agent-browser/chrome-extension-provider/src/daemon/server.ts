@@ -1244,6 +1244,12 @@ export class BridgeDaemon {
       scope.targetIds.add(childTargetId);
       claimedTargets.add(childTargetId);
       changed = true;
+      this.logger.debug("child target adopted by bridge session", {
+        profileId,
+        tabId: tab.tabId,
+        openerTabId: tab.openerTabId,
+        bridgeSessionId,
+      });
       if (this.controlStates.get(bridgeSessionId)?.phase === "agent") {
         this.broadcastTargetEvent(bridgeSessionId, "Target.targetCreated", {
           targetInfo: targetInfoFor(profileId, tab, false),
