@@ -753,6 +753,7 @@ async function allTabs(): Promise<BridgeTab[]> {
 function tabToBridgeTab(tab: chrome.tabs.Tab): BridgeTab {
   return {
     tabId: tab.id ?? -1,
+    openerTabId: tab.openerTabId,
     windowId: tab.windowId,
     url: tab.url ?? "",
     title: tab.title ?? "",

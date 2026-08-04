@@ -164,6 +164,7 @@ export class BridgeDaemon {
   private readonly controlEvents: QueuedControlEvent[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly cdpClients = new Map<WebSocket, string>();
+  private readonly targetDiscoveryClients = new Set<WebSocket>();
   private readonly controlEventStreamId = randomUUID();
   private attachSequence = 1;
   private commandSequence = 1;
@@ -745,6 +746,7 @@ export class BridgeDaemon {
         ws.close();
         return;
       }
+      const previousTabs = this.profiles.get(message.profileId)?.tabs ?? new Map<number, BridgeTab>();
       this.profiles.set(message.profileId, {
         profileId: message.profileId,
         extensionId: message.extensionId,
@@ -753,6 +755,7 @@ export class BridgeDaemon {
         ws,
         tabs: tabsToMap(message.tabs ?? []),
       });
+      this.reconcileOwnedChildTargets(message.profileId, previousTabs);
       await this.reconcileProfileTabs(message.profileId);
       await this.resyncProfileOverlays(message.profileId);
       this.logger.debug("extension profile connected", { profileId: message.profileId });
@@ -761,7 +764,9 @@ export class BridgeDaemon {
     if (message.kind === "heartbeat") {
       const peer = this.profiles.get(message.profileId);
       if (peer && message.tabs) {
+        const previousTabs = peer.tabs;
         peer.tabs = tabsToMap(message.tabs);
+        this.reconcileOwnedChildTargets(message.profileId, previousTabs);
         await this.reconcileProfileTabs(message.profileId);
       }
       return;
@@ -811,6 +816,7 @@ export class BridgeDaemon {
     });
     ws.on("close", () => {
       this.cdpClients.delete(ws);
+      this.targetDiscoveryClients.delete(ws);
     });
   }
 
@@ -824,7 +830,7 @@ export class BridgeDaemon {
       return;
     }
     try {
-      const browserLevel = await this.routeBrowserLevel(bridgeSession, message);
+      const browserLevel = await this.routeBrowserLevel(ws, bridgeSession, message);
       if (browserLevel.handled) {
         this.sendCdpResult(ws, message.id, browserLevel.result);
         return;
@@ -846,6 +852,7 @@ export class BridgeDaemon {
   }
 
   private async routeBrowserLevel(
+    ws: WebSocket,
     bridgeSession: BridgeSession,
     request: CdpRequest,
   ): Promise<{ handled: boolean; result?: unknown }> {
@@ -870,6 +877,8 @@ export class BridgeDaemon {
       return { handled: true, result: {} };
     }
     if (method === "Target.setDiscoverTargets") {
+      if (request.params?.discover === true) this.targetDiscoveryClients.add(ws);
+      else this.targetDiscoveryClients.delete(ws);
       return { handled: true, result: {} };
     }
     if (method === "Target.setAutoAttach") {
@@ -1169,6 +1178,112 @@ export class BridgeDaemon {
     }
   }
 
+  /**
+   * Extend an existing target ownership chain to child tabs created by that
+   * target. Chrome reports a child before its final URL is always known, so the
+   * full heartbeat snapshot is reconciled on every pass rather than considering
+   * only newly seen tab ids.
+   */
+  private reconcileOwnedChildTargets(
+    profileId: string,
+    previousTabs: Map<number, BridgeTab>,
+  ): void {
+    const peer = this.profiles.get(profileId);
+    if (!peer) return;
+    const claimedTargets = new Set<string>();
+    for (const scope of this.sessionTargetScopes.values()) {
+      for (const targetId of scope.targetIds) claimedTargets.add(targetId);
+      for (const targetId of scope.attachedTargetIds) claimedTargets.add(targetId);
+    }
+
+    let changed = false;
+    for (const tab of peer.tabs.values()) {
+      if (typeof tab.openerTabId !== "number" || !shouldExposeTab(tab)) continue;
+      const childTargetId = targetIdFor(profileId, tab.tabId);
+      if (claimedTargets.has(childTargetId)) continue;
+      const openerTargetId = targetIdFor(profileId, tab.openerTabId);
+      const candidates = [...this.sessionTargetScopes.entries()].filter(([sessionId, scope]) => {
+        const control = this.controlStates.get(sessionId);
+        return (
+          control !== undefined &&
+          control.phase !== "stopped" &&
+          this.bridgeSessions.has(sessionId) &&
+          (scope.targetIds.has(openerTargetId) || scope.attachedTargetIds.has(openerTargetId))
+        );
+      });
+      if (candidates.length !== 1) {
+        if (candidates.length > 1) {
+          this.logger.error("child target ownership is ambiguous", {
+            profileId,
+            tabId: tab.tabId,
+            openerTabId: tab.openerTabId,
+            candidateSessionIds: candidates.map(([sessionId]) => sessionId),
+          });
+        }
+        continue;
+      }
+      const [bridgeSessionId, scope] = candidates[0];
+      scope.targetIds.add(childTargetId);
+      claimedTargets.add(childTargetId);
+      changed = true;
+      if (this.controlStates.get(bridgeSessionId)?.phase === "agent") {
+        this.broadcastTargetEvent(bridgeSessionId, "Target.targetCreated", {
+          targetInfo: targetInfoFor(profileId, tab, false),
+        });
+      }
+    }
+
+    for (const [bridgeSessionId, scope] of this.sessionTargetScopes) {
+      const phase = this.controlStates.get(bridgeSessionId)?.phase;
+      for (const targetId of [...scope.targetIds]) {
+        const ref = parseTargetId(targetId);
+        if (ref?.profileId !== profileId) continue;
+        const previous = previousTabs.get(ref.tabId);
+        const current = peer.tabs.get(ref.tabId);
+        if (previous && !current) {
+          scope.targetIds.delete(targetId);
+          scope.attachedTargetIds.delete(targetId);
+          claimedTargets.delete(targetId);
+          changed = true;
+          if (phase !== "stopped") {
+            this.broadcastTargetEvent(bridgeSessionId, "Target.targetDestroyed", { targetId });
+          }
+          continue;
+        }
+        if (
+          previous &&
+          current &&
+          phase !== "stopped" &&
+          (previous.url !== current.url ||
+            previous.title !== current.title ||
+            previous.openerTabId !== current.openerTabId)
+        ) {
+          this.broadcastTargetEvent(bridgeSessionId, "Target.targetInfoChanged", {
+            targetInfo: targetInfoFor(profileId, current, this.hasAttachedSession(profileId, ref.tabId)),
+          });
+        }
+      }
+    }
+    if (changed) this.persistSessions();
+  }
+
+  private broadcastTargetEvent(
+    bridgeSessionId: string,
+    method: string,
+    params: Record<string, unknown>,
+  ): void {
+    const event = JSON.stringify({ method, params });
+    for (const [client, clientBridgeSessionId] of this.cdpClients) {
+      if (
+        clientBridgeSessionId === bridgeSessionId &&
+        this.targetDiscoveryClients.has(client) &&
+        client.readyState === WebSocket.OPEN
+      ) {
+        client.send(event);
+      }
+    }
+  }
+
   private enqueueControlEvent(event: Omit<QueuedControlEvent, "sequence" | "createdAt">): void {
     this.controlEvents.push({
       ...event,
@@ -1373,6 +1488,9 @@ export class BridgeDaemon {
       epoch: (current?.epoch ?? 0) + 1,
       updatedAt: new Date().toISOString(),
     });
+    if (phase === "agent" && current?.phase !== "agent") {
+      this.replayUnattachedOwnedTargets(session);
+    }
     if (phase !== "agent") this.cancelPendingForSession(session.sessionId, phase);
     const attached = [...this.attachedSessions.values()].filter(
       (entry) => entry.bridgeSessionId === session.sessionId,
@@ -1442,6 +1560,22 @@ export class BridgeDaemon {
     }
     this.persistSessions();
     return focusConfirmed;
+  }
+
+  private replayUnattachedOwnedTargets(session: BridgeSession): void {
+    const scope = this.sessionTargetScopes.get(session.sessionId);
+    if (!scope) return;
+    for (const targetId of scope.targetIds) {
+      const ref = parseTargetId(targetId);
+      const peer = ref ? this.profiles.get(ref.profileId) : undefined;
+      const tab = ref ? peer?.tabs.get(ref.tabId) : undefined;
+      if (!ref || !tab || !shouldExposeTab(tab) || this.hasAttachedSession(ref.profileId, ref.tabId)) {
+        continue;
+      }
+      this.broadcastTargetEvent(session.sessionId, "Target.targetCreated", {
+        targetInfo: targetInfoFor(ref.profileId, tab, false),
+      });
+    }
   }
 
   private hasFocusableTarget(session: BridgeSession): boolean {
