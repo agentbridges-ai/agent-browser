@@ -1282,7 +1282,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
       ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
     });
     const cdp = await connectCdp(port, session.sessionId, session.token);
-    await cdpCommand(cdp, {
+    const attached = await cdpCommand(cdp, {
       id: 1,
       method: "Target.attachToTarget",
       params: { targetId: "tab:profile-a:101", flatten: true },
@@ -1299,6 +1299,32 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
     );
     assert.equal(response.status, 409);
     assert.match((await response.json()).error, /focus rejected/);
+
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "agent" });
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "control-event",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: attached.result.sessionId,
+        action: "takeover",
+      }),
+    );
+    await waitFor(async () => {
+      const events = await fetchJson(port, "/control/events?after=0");
+      return events.events.length === 1;
+    });
+    const afterPageTakeover = await fetchJson(port, "/health");
+    assert.equal(afterPageTakeover.daemon, "ok");
+    assert.equal(afterPageTakeover.sessions[0].control.phase, "human");
+    assert.ok(
+      extension.commands.some(
+        (command) =>
+          command.method === "Bridge.setControlOverlay" && command.params.phase === "human",
+      ),
+      "page takeover must finish fencing control after a redundant focus request is rejected",
+    );
     cdp.close();
   } finally {
     extension.close();
@@ -1378,6 +1404,299 @@ test("daemon routes CDP events only to the owning bridge session", async () => {
 
     first.close();
     second.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("an owned opener adopts its child tab and exposes it only to that bridge session", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    {
+      tabId: 101,
+      windowId: 1,
+      url: "http://127.0.0.1:3458/workspace/it/session/session-a",
+      title: "Nexolyra",
+      active: true,
+    },
+  ]);
+
+  try {
+    const owner = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      profileUrlHint: "/session/session-a",
+    });
+    const other = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-bbbbbbbbbbbbbbbb",
+      profileUrlHint: "/session/session-b",
+    });
+    const ownerCdp = await connectCdp(port, owner.sessionId, owner.token);
+    const otherCdp = await connectCdp(port, other.sessionId, other.token);
+    await cdpCommand(ownerCdp, {
+      id: 10,
+      method: "Target.setDiscoverTargets",
+      params: { discover: true },
+    });
+    await cdpCommand(otherCdp, {
+      id: 11,
+      method: "Target.setDiscoverTargets",
+      params: { discover: true },
+    });
+    const created = await cdpCommand(ownerCdp, {
+      id: 1,
+      method: "Target.createTarget",
+      params: { url: "https://weibo.example/rank" },
+    });
+    assert.equal(created.result.targetId, "tab:profile-a:303");
+    await cdpCommand(ownerCdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: created.result.targetId, flatten: true },
+    });
+
+    const ownerEvents = [];
+    const otherEvents = [];
+    ownerCdp.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.method) ownerEvents.push(message);
+    });
+    otherCdp.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.method) otherEvents.push(message);
+    });
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 101,
+            windowId: 1,
+            url: "http://127.0.0.1:3458/workspace/it/session/session-a",
+            title: "Nexolyra",
+            active: false,
+          },
+          {
+            tabId: 303,
+            windowId: 99,
+            url: "https://weibo.example/rank",
+            title: "Rank",
+            active: false,
+          },
+          {
+            tabId: 404,
+            openerTabId: 303,
+            windowId: 99,
+            url: "https://weibo.example/detail/2",
+            title: "Second trend",
+            active: true,
+          },
+        ],
+      }),
+    );
+
+    await waitFor(() =>
+      ownerEvents.some(
+        (event) =>
+          event.method === "Target.targetCreated" &&
+          event.params?.targetInfo?.targetId === "tab:profile-a:404",
+      ),
+    );
+    assert.equal(otherEvents.length, 0);
+
+    const ownerTargets = await cdpCommand(ownerCdp, {
+      id: 3,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.deepEqual(
+      ownerTargets.result.targetInfos.map((target) => target.targetId).sort(),
+      ["tab:profile-a:303", "tab:profile-a:404"],
+    );
+    const otherTargets = await cdpCommand(otherCdp, {
+      id: 4,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.deepEqual(otherTargets.result.targetInfos, []);
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 303,
+            windowId: 99,
+            url: "https://weibo.example/rank",
+            title: "Rank",
+            active: false,
+          },
+          {
+            tabId: 404,
+            openerTabId: 303,
+            windowId: 99,
+            url: "https://weibo.example/detail/2?loaded=1",
+            title: "Second trend loaded",
+            active: true,
+          },
+        ],
+      }),
+    );
+    await waitFor(() =>
+      ownerEvents.some(
+        (event) =>
+          event.method === "Target.targetInfoChanged" &&
+          event.params?.targetInfo?.url === "https://weibo.example/detail/2?loaded=1",
+      ),
+    );
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 303,
+            windowId: 99,
+            url: "https://weibo.example/rank",
+            title: "Rank",
+            active: true,
+          },
+        ],
+      }),
+    );
+    await waitFor(() =>
+      ownerEvents.some(
+        (event) =>
+          event.method === "Target.targetDestroyed" &&
+          event.params?.targetId === "tab:profile-a:404",
+      ),
+    );
+    const remainingTargets = await cdpCommand(ownerCdp, {
+      id: 5,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.deepEqual(
+      remainingTargets.result.targetInfos.map((target) => target.targetId),
+      ["tab:profile-a:303"],
+    );
+
+    ownerCdp.close();
+    otherCdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("human-created child ownership is replayed to the agent after its URL becomes automatable", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    {
+      tabId: 101,
+      windowId: 1,
+      url: "http://127.0.0.1:3458/workspace/it/session/session-a",
+      title: "Nexolyra",
+      active: true,
+    },
+  ]);
+
+  try {
+    const owner = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      profileUrlHint: "/session/session-a",
+    });
+    const cdp = await connectCdp(port, owner.sessionId, owner.token);
+    await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.setDiscoverTargets",
+      params: { discover: true },
+    });
+    const created = await cdpCommand(cdp, {
+      id: 2,
+      method: "Target.createTarget",
+      params: { url: "https://weibo.example/rank" },
+    });
+    await cdpCommand(cdp, {
+      id: 3,
+      method: "Target.attachToTarget",
+      params: { targetId: created.result.targetId, flatten: true },
+    });
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "human" });
+
+    const events = [];
+    cdp.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.method) events.push(message);
+    });
+    const heartbeat = (url) =>
+      extension.send(
+        JSON.stringify({
+          v: 1,
+          kind: "heartbeat",
+          profileId: "profile-a",
+          tabs: [
+            {
+              tabId: 303,
+              windowId: 99,
+              url: "https://weibo.example/rank",
+              title: "Rank",
+              active: false,
+            },
+            {
+              tabId: 404,
+              openerTabId: 303,
+              windowId: 99,
+              url,
+              title: "Second trend",
+              active: true,
+            },
+          ],
+        }),
+      );
+
+    heartbeat("chrome://newtab/");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    let targets = await cdpCommand(cdp, { id: 4, method: "Target.getTargets", params: {} });
+    assert.deepEqual(
+      targets.result.targetInfos.map((target) => target.targetId),
+      ["tab:profile-a:303"],
+    );
+
+    heartbeat("https://weibo.example/detail/2");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    targets = await cdpCommand(cdp, { id: 5, method: "Target.getTargets", params: {} });
+    assert.deepEqual(
+      targets.result.targetInfos.map((target) => target.targetId).sort(),
+      ["tab:profile-a:303", "tab:profile-a:404"],
+    );
+    assert.equal(
+      events.some((event) => event.method === "Target.targetCreated"),
+      false,
+      "human ownership must not attach the agent",
+    );
+
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "agent" });
+    await waitFor(() =>
+      events.some(
+        (event) =>
+          event.method === "Target.targetCreated" &&
+          event.params?.targetInfo?.targetId === "tab:profile-a:404",
+      ),
+    );
+
+    cdp.close();
   } finally {
     extension.close();
     await daemon.stop();

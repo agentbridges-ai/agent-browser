@@ -2126,30 +2126,18 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let started_at = std::time::Instant::now();
+    // Capture the server before dispatch so every command observed as running
+    // reaches one terminal event even when dispatch returns early. Stream
+    // lifecycle commands are excluded: enable has no server yet and disable
+    // intentionally closes its viewers before returning.
+    let stream_server = if action != INTERNAL_DAEMON_SHUTDOWN_ACTION && action != "stream_disable" {
+        state.stream_server.clone()
+    } else {
+        None
+    };
 
-    let cmd_start = std::time::Instant::now();
-
-    if let Err(err) = validate_restore_config_from_command(cmd) {
-        return error_response(&id, &err);
-    }
-
-    // Invalid inputs are rejected before expensive setup: an unsupported
-    // `find` action must fail here, not after a browser launch and a locator
-    // resolution that can mask it with "element not found".
-    if let Err(err) = validate_find_subaction(action, cmd) {
-        return error_response(&id, &err);
-    }
-
-    if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
-        let mut resp = match handle_close(state).await {
-            Ok(data) => success_response(&id, data),
-            Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
-        };
-        inject_lifecycle(&mut resp, state, false, false, false);
-        return resp;
-    }
-
-    if let Some(ref server) = state.stream_server {
+    if let Some(ref server) = stream_server {
         let mut broadcast_cmd;
         let has_internal_fields = cmd.get("plugins").is_some()
             || cmd.get("restoreKey").is_some()
@@ -2172,6 +2160,58 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             cmd
         };
         server.broadcast_command(action, &id, cmd_for_broadcast);
+    }
+
+    let resp = execute_command_inner(cmd, state).await;
+
+    if let Some(ref server) = stream_server {
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        let success = response_succeeded(&resp);
+        let data = resp.get("data").cloned().unwrap_or(Value::Null);
+        server.broadcast_result(&id, action, success, &data, duration_ms);
+
+        if let Some(ref mgr) = state.browser {
+            server.broadcast_tabs(&mgr.tab_list()).await;
+            if matches!(
+                action,
+                "tab_new" | "tab_switch" | "tab_close" | "open" | "navigate"
+            ) {
+                let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
+                server.set_cdp_session_id(session_id).await;
+                server.notify_client_changed();
+            }
+        }
+    }
+
+    resp
+}
+
+async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
+    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let id = cmd
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if let Err(err) = validate_restore_config_from_command(cmd) {
+        return error_response(&id, &err);
+    }
+
+    // Invalid inputs are rejected before expensive setup: an unsupported
+    // `find` action must fail here, not after a browser launch and a locator
+    // resolution that can mask it with "element not found".
+    if let Err(err) = validate_find_subaction(action, cmd) {
+        return error_response(&id, &err);
+    }
+
+    if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
+        let mut resp = match handle_close(state).await {
+            Ok(data) => success_response(&id, data),
+            Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
+        };
+        inject_lifecycle(&mut resp, state, false, false, false);
+        return resp;
     }
 
     // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
@@ -2580,31 +2620,6 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                         dialog.dialog_type, dialog.message
                     )),
                 );
-            }
-        }
-    }
-
-    if let Some(ref server) = state.stream_server {
-        let duration_ms = cmd_start.elapsed().as_millis() as u64;
-        let success = resp
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == "success");
-        let data = resp.get("data").cloned().unwrap_or(Value::Null);
-        server.broadcast_result(&id, action, success, &data, duration_ms);
-
-        if let Some(ref mgr) = state.browser {
-            server.broadcast_tabs(&mgr.tab_list()).await;
-
-            // Keep the stream server's CDP session in sync with the active tab
-            // so screencasting always targets the correct page.
-            if matches!(
-                action,
-                "tab_new" | "tab_switch" | "tab_close" | "open" | "navigate"
-            ) {
-                let session_id = mgr.active_session_id().ok().map(|s| s.to_string());
-                server.set_cdp_session_id(session_id).await;
-                server.notify_client_changed();
             }
         }
     }
@@ -11113,6 +11128,10 @@ fn success_response(id: &str, data: Value) -> Value {
     })
 }
 
+fn response_succeeded(response: &Value) -> bool {
+    response.get("success").and_then(Value::as_bool) == Some(true)
+}
+
 fn inject_lifecycle(
     resp: &mut Value,
     state: &DaemonState,
@@ -11175,6 +11194,7 @@ mod tests {
     use super::super::cdp::types::{AXNode, AXValue};
     use super::*;
     use crate::test_utils::EnvGuard;
+    use futures_util::StreamExt;
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -12657,6 +12677,90 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             "stream disable should not clear an independently managed screencast state"
         );
 
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn streamed_commands_always_finish_with_the_real_response_outcome() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let socket_dir = unique_socket_dir("stream-command-results");
+        fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.to_str().expect("socket dir should be utf-8"),
+        );
+        guard.set("AGENT_BROWSER_SESSION", "stream-command-results-session");
+
+        let mut state = DaemonState::new();
+        let enabled = handle_stream_enable(&json!({ "port": 0 }), &mut state)
+            .await
+            .expect("stream enable should succeed");
+        let port = enabled["port"]
+            .as_u64()
+            .expect("stream enable should report a port");
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+            .await
+            .expect("stream websocket should connect");
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("stream should emit its initial status");
+
+        let success = execute_command(
+            &json!({ "id": "stream-success", "action": "stream_status" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(success["success"], true);
+
+        let invalid = execute_command(
+            &json!({ "id": "stream-invalid", "action": "getbyrole", "subaction": "type" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(invalid["success"], false);
+
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && events.len() < 4 {
+            let message =
+                tokio::time::timeout(tokio::time::Duration::from_millis(250), ws.next()).await;
+            let Some(Ok(message)) = message.ok().flatten() else {
+                continue;
+            };
+            if !message.is_text() {
+                continue;
+            }
+            let event: Value = serde_json::from_str(
+                message
+                    .to_text()
+                    .expect("stream message should contain text"),
+            )
+            .expect("stream message should contain JSON");
+            if event["type"] == "command" || event["type"] == "result" {
+                events.push(event);
+            }
+        }
+
+        assert_eq!(
+            events.len(),
+            4,
+            "each command must have one terminal result"
+        );
+        assert_eq!(events[0]["type"], "command");
+        assert_eq!(events[0]["id"], "stream-success");
+        assert_eq!(events[1]["type"], "result");
+        assert_eq!(events[1]["id"], "stream-success");
+        assert_eq!(events[1]["success"], true);
+        assert_eq!(events[2]["type"], "command");
+        assert_eq!(events[2]["id"], "stream-invalid");
+        assert_eq!(events[3]["type"], "result");
+        assert_eq!(events[3]["id"], "stream-invalid");
+        assert_eq!(events[3]["success"], false);
+
+        drop(ws);
+        handle_stream_disable(&mut state)
+            .await
+            .expect("stream disable should succeed");
         let _ = fs::remove_dir_all(&socket_dir);
     }
 

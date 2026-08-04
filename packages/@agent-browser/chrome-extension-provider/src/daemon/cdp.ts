@@ -40,7 +40,9 @@ export function targetInfoFor(profileId: string, tab: BridgeTab, attached: boole
     title: tab.title,
     url: tab.url,
     attached,
-    canAccessOpener: false,
+    ...(typeof tab.openerTabId === "number"
+      ? { openerId: targetIdFor(profileId, tab.openerTabId), canAccessOpener: true }
+      : { canAccessOpener: false }),
     browserContextId: `profile:${profileId}`,
   };
 }

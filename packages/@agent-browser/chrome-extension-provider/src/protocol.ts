@@ -33,6 +33,7 @@ export type PluginResponse = {
 
 export type BridgeTab = {
   tabId: number;
+  openerTabId?: number;
   windowId?: number;
   url: string;
   title: string;
