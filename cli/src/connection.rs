@@ -1060,7 +1060,19 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
         }
 
         match send_command_once(&cmd, session) {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                // A successful `close` response means the browser backends
+                // are gone, but the daemon writes that response just before
+                // its socket loop exits. Do not let a caller immediately
+                // recreate the same session while the old daemon can still
+                // unlink the new socket during its final cleanup.
+                if response.success
+                    && cmd.get("action").and_then(|value| value.as_str()) == Some("close")
+                {
+                    finish_daemon_shutdown(session);
+                }
+                return Ok(response);
+            }
             Err(e) => {
                 if is_transient_error(&e) {
                     last_error = e;
@@ -1076,6 +1088,18 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
         "{} (after {} retries - daemon may be busy or unresponsive)",
         last_error, MAX_RETRIES
     ))
+}
+
+fn finish_daemon_shutdown(session: &str) {
+    if wait_for_daemon_exit(session, Duration::from_secs(5)) {
+        return;
+    }
+
+    // `close` is a lifecycle guarantee, not merely a request. If a daemon
+    // acknowledged the close but failed to terminate, use the same bounded
+    // exact-session cleanup path as a configuration restart rather than
+    // leaving a live process and stale socket behind.
+    kill_stale_daemon(session);
 }
 
 /// Check if an error is transient and worth retrying against the SAME daemon.
@@ -1439,6 +1463,34 @@ mod tests {
     #[test]
     fn test_daemon_startup_budget_covers_slow_provider_attachment() {
         assert!(DAEMON_STARTUP_TIMEOUT >= Duration::from_secs(15));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_close_waits_until_the_acknowledging_daemon_releases_its_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        let session = "close-drain";
+        let socket_path = get_socket_path(session);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let cleanup_path = socket_path.clone();
+        let cleanup = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(listener);
+            fs::remove_file(cleanup_path).unwrap();
+        });
+
+        let started = Instant::now();
+        finish_daemon_shutdown(session);
+        cleanup.join().unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(!socket_path.exists());
     }
 
     #[test]
