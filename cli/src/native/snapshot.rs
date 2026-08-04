@@ -81,6 +81,9 @@ pub struct SnapshotOptions {
     pub compact: bool,
     pub depth: Option<usize>,
     pub urls: bool,
+    /// Restrict the snapshot to CDP domains that cannot execute page script
+    /// or mutate business state. Used by the ownership handoff readback gate.
+    pub readback_only: bool,
 }
 
 struct TreeNode {
@@ -359,10 +362,13 @@ pub async fn take_snapshot(
     let mut nodes_with_refs: Vec<(usize, usize)> = Vec::new();
 
     // Pre-collect cursor-interactive elements so we can mark them with refs during tree building
-    let cursor_elements: HashMap<i64, CursorElementInfo> =
+    let cursor_elements: HashMap<i64, CursorElementInfo> = if options.readback_only {
+        HashMap::new()
+    } else {
         find_cursor_interactive_elements(client, session_id)
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
 
     promote_hidden_inputs(&mut tree_nodes, &cursor_elements);
 

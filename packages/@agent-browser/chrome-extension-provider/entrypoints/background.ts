@@ -21,7 +21,7 @@ const attachedTabs = new Set<number>();
 type ControlOverlay = {
   nonce: string;
   sessionId: string;
-  phase: "agent" | "human" | "stopped";
+  phase: "agent" | "human" | "resuming" | "stopped";
   returnPath?: string;
   returnOrigin?: string;
   frameId?: string;
@@ -322,7 +322,12 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     const sessionId = command.sessionId;
     const phase = command.params?.phase;
     if (!sessionId) throw new Error("Bridge.setControlOverlay requires sessionId");
-    if (phase !== "agent" && phase !== "human" && phase !== "stopped") {
+    if (
+      phase !== "agent" &&
+      phase !== "human" &&
+      phase !== "resuming" &&
+      phase !== "stopped"
+    ) {
       throw new Error("Bridge.setControlOverlay requires a valid phase");
     }
     const returnPath =
@@ -549,6 +554,7 @@ async function injectCurrentControlOverlay(tabId: number): Promise<void> {
     nonce: overlay.nonce,
     phase: overlay.phase,
     showReturn: overlay.phase === "human" && Boolean(overlay.returnOrigin && overlay.returnPath),
+    copy: operatorOverlayCopy(),
   });
   const expression = `(() => {
     const config = ${config};
@@ -562,7 +568,7 @@ async function injectCurrentControlOverlay(tabId: number): Promise<void> {
     const bar = document.createElement("div");
     bar.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:999px;background:#111827;color:#fff;box-shadow:0 8px 28px rgba(0,0,0,.35);pointer-events:auto;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif";
     const label = document.createElement("span");
-    label.textContent = config.phase === "agent" ? "Agent is browsing…" : config.phase === "human" ? "You’re in control · Resume in Nexolyra" : "Browser control stopped";
+    label.textContent = config.phase === "agent" ? config.copy.agent : config.phase === "human" ? config.copy.human : config.phase === "resuming" ? config.copy.resuming : config.copy.stopped;
     label.style.cssText = "padding:0 6px;white-space:nowrap";
     bar.append(label);
     const button = (text, action, primary) => {
@@ -576,11 +582,11 @@ async function injectCurrentControlOverlay(tabId: number): Promise<void> {
       });
       return node;
     };
-    if (config.phase === "agent") bar.append(button("Take over", "takeover", true));
+    if (config.phase === "agent") bar.append(button(config.copy.takeOver, "takeover", true));
     if (config.phase === "human" && config.showReturn) {
-      bar.append(button("Return to Nexolyra", "return", true));
+      bar.append(button(config.copy.returnToNexolyra, "return", true));
     }
-    if (config.phase !== "stopped") bar.append(button("Stop", "stop", false));
+    if (config.phase !== "stopped") bar.append(button(config.copy.stop, "stop", false));
     shadow.append(bar);
     (document.documentElement || document.body)?.append(host);
   })()`;
@@ -590,6 +596,38 @@ async function injectCurrentControlOverlay(tabId: number): Promise<void> {
     awaitPromise: false,
     returnByValue: true,
   });
+}
+
+function operatorOverlayCopy(): {
+  agent: string;
+  human: string;
+  resuming: string;
+  stopped: string;
+  takeOver: string;
+  returnToNexolyra: string;
+  stop: string;
+} {
+  const language = chrome.i18n.getUILanguage().toLowerCase();
+  if (language === "zh" || language.startsWith("zh-")) {
+    return {
+      agent: "Agent 正在浏览…",
+      human: "你正在控制 · 请在 Nexolyra 中交还",
+      resuming: "正在回读页面并交还给 Agent…",
+      stopped: "浏览器控制已停止",
+      takeOver: "接管",
+      returnToNexolyra: "返回 Nexolyra",
+      stop: "停止",
+    };
+  }
+  return {
+    agent: "Agent is browsing…",
+    human: "You’re in control · Resume in Nexolyra",
+    resuming: "Reading the page before Agent resumes…",
+    stopped: "Browser control stopped",
+    takeOver: "Take over",
+    returnToNexolyra: "Return to Nexolyra",
+    stop: "Stop",
+  };
 }
 
 async function activateNexolyraTab(
