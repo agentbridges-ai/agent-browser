@@ -700,7 +700,15 @@ export class BridgeDaemon {
         );
         return;
       }
-      void this.handleBridgeMessage(ws, message);
+      void this.handleBridgeMessage(ws, message).catch((error) => {
+        // Extension messages are an external event stream. One rejected focus
+        // or stale detach must not become an unhandled rejection that kills
+        // the shared daemon and disconnects every browser-control session.
+        this.logger.error("extension bridge message failed", {
+          kind: message.kind,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
     });
     ws.on("close", () => {
       for (const [profileId, peer] of this.profiles) {
@@ -1110,7 +1118,17 @@ export class BridgeDaemon {
     const pendingActionRisk = [...this.pending.values()].some(
       (pending) => pending.bridgeSessionId === bridgeSession.sessionId,
     );
-    await this.setBridgeControl(bridgeSession, message.action === "takeover" ? "human" : "stopped");
+    await this.setBridgeControl(
+      bridgeSession,
+      message.action === "takeover" ? "human" : "stopped",
+      {
+        preferredAttached: attached,
+        // The operator clicked inside this exact page, so ownership must be
+        // fenced even if macOS/Chrome declines a redundant focus request. The
+        // host-side takeover route remains strict and reports focus failure.
+        tolerateFocusFailure: message.action === "takeover",
+      },
+    );
     this.enqueueControlEvent({
       ownerSessionId: bridgeSession.ownerSessionId,
       bridgeSessionId: bridgeSession.sessionId,
@@ -1478,7 +1496,14 @@ export class BridgeDaemon {
     };
   }
 
-  private async setBridgeControl(session: BridgeSession, phase: ControlPhase): Promise<boolean> {
+  private async setBridgeControl(
+    session: BridgeSession,
+    phase: ControlPhase,
+    options: {
+      preferredAttached?: AttachedSession;
+      tolerateFocusFailure?: boolean;
+    } = {},
+  ): Promise<boolean> {
     const current = this.controlStates.get(session.sessionId);
     // Repeating human control is an explicit focus request from the UI. It
     // must re-activate the exact tab/window instead of becoming a no-op.
@@ -1503,6 +1528,7 @@ export class BridgeDaemon {
     let focusConfirmed = phase !== "human";
     if (phase === "human") {
       const focused =
+        attached.find((entry) => entry.sessionId === options.preferredAttached?.sessionId) ??
         attached.find(
           (entry) => this.profiles.get(entry.profileId)?.tabs.get(entry.tabId)?.active,
         ) ?? attached.at(-1);
@@ -1524,12 +1550,19 @@ export class BridgeDaemon {
       if (peer?.ws.readyState === WebSocket.OPEN && typeof tabId === "number") {
         // Human takeover is not acknowledged to the host until Chrome has
         // confirmed that the exact controlled tab and its window were focused.
-        await this.sendBridgeCommand(peer, {
-          method: "Bridge.activateTab",
-          tabId,
-          params: { tabId },
-        });
-        focusConfirmed = true;
+        try {
+          await this.sendBridgeCommand(peer, {
+            method: "Bridge.activateTab",
+            tabId,
+            params: { tabId },
+          });
+          const activeTab = peer.tabs.get(tabId);
+          if (activeTab) this.markTabActive(peer, activeTab);
+          focusConfirmed = true;
+        } catch (error) {
+          if (!options.tolerateFocusFailure) throw error;
+          focusConfirmed = false;
+        }
       }
     }
     for (const entry of attached) {

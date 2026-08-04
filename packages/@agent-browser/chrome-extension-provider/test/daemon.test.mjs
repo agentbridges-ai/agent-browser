@@ -1282,7 +1282,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
       ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
     });
     const cdp = await connectCdp(port, session.sessionId, session.token);
-    await cdpCommand(cdp, {
+    const attached = await cdpCommand(cdp, {
       id: 1,
       method: "Target.attachToTarget",
       params: { targetId: "tab:profile-a:101", flatten: true },
@@ -1299,6 +1299,32 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
     );
     assert.equal(response.status, 409);
     assert.match((await response.json()).error, /focus rejected/);
+
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "agent" });
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "control-event",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: attached.result.sessionId,
+        action: "takeover",
+      }),
+    );
+    await waitFor(async () => {
+      const events = await fetchJson(port, "/control/events?after=0");
+      return events.events.length === 1;
+    });
+    const afterPageTakeover = await fetchJson(port, "/health");
+    assert.equal(afterPageTakeover.daemon, "ok");
+    assert.equal(afterPageTakeover.sessions[0].control.phase, "human");
+    assert.ok(
+      extension.commands.some(
+        (command) =>
+          command.method === "Bridge.setControlOverlay" && command.params.phase === "human",
+      ),
+      "page takeover must finish fencing control after a redundant focus request is rejected",
+    );
     cdp.close();
   } finally {
     extension.close();
