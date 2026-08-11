@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
 import {
-  parseControlToken,
-  parseSessionGrantSecret,
+  readControlSecretsFd,
   readBridgeConfig,
 } from "../config.js";
 import { BridgeDaemon } from "./server.js";
@@ -11,16 +9,7 @@ const config = readBridgeConfig();
 let controlToken = config.controlToken;
 let sessionGrantSecret = config.sessionGrantSecret;
 if (config.controlSecretsFd !== undefined) {
-  const secrets = JSON.parse(readFileSync(config.controlSecretsFd, "utf8")) as Record<
-    string,
-    unknown
-  >;
-  controlToken = parseControlToken(
-    typeof secrets.controlToken === "string" ? secrets.controlToken : undefined,
-  );
-  sessionGrantSecret = parseSessionGrantSecret(
-    typeof secrets.sessionGrantSecret === "string" ? secrets.sessionGrantSecret : undefined,
-  );
+  ({ controlToken, sessionGrantSecret } = readControlSecretsFd(config.controlSecretsFd));
 }
 if (config.supervisedByNexolyra && config.controlSecretsFd === undefined) {
   throw new Error("A supervised Chrome bridge daemon requires a private inherited control fd");

@@ -1,16 +1,38 @@
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
-import { parseExtensionId, readBridgeConfig } from "../dist/config.js";
+import { parseExtensionId, readBridgeConfig, readControlSecretsFd } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 
 const TEST_CONTROL_TOKEN = "a".repeat(64);
 const TEST_SESSION_GRANT_SECRET = "b".repeat(64);
+
+test("control secrets fd is consumed once and closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-control-fd-"));
+  const path = join(root, "secrets.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      controlToken: TEST_CONTROL_TOKEN,
+      sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+    }),
+  );
+  const fd = openSync(path, "r");
+  try {
+    assert.deepEqual(readControlSecretsFd(fd), {
+      controlToken: TEST_CONTROL_TOKEN,
+      sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+    });
+    assert.throws(() => fstatSync(fd), /bad file descriptor/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function createDaemon(options) {
   return new BridgeDaemon({

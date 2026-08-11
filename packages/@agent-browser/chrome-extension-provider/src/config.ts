@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { closeSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -21,6 +22,27 @@ export type BridgeConfig = {
   legacyStatePaths: string[];
   supervisedByNexolyra: boolean;
 };
+
+export function readControlSecretsFd(fd: number): {
+  controlToken: string;
+  sessionGrantSecret: string;
+} {
+  try {
+    const secrets = JSON.parse(readFileSync(fd, "utf8")) as Record<string, unknown>;
+    const controlToken = parseControlToken(
+      typeof secrets.controlToken === "string" ? secrets.controlToken : undefined,
+    );
+    const sessionGrantSecret = parseSessionGrantSecret(
+      typeof secrets.sessionGrantSecret === "string" ? secrets.sessionGrantSecret : undefined,
+    );
+    if (!controlToken || !sessionGrantSecret) {
+      throw new Error("Control fd did not contain both required Chrome bridge secrets");
+    }
+    return { controlToken, sessionGrantSecret };
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   const logPath = nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG);
