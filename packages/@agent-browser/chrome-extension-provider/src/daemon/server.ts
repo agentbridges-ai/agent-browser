@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
@@ -39,6 +39,8 @@ import { createLogger, type Logger } from "./logger.js";
 export type BridgeDaemonOptions = {
   port: number;
   allowedExtensionId?: string;
+  controlToken?: string;
+  sessionGrantSecret?: string;
   logPath?: string;
   commandTimeoutMs?: number;
   detachedTargetGraceMs?: number;
@@ -97,18 +99,40 @@ type ControlState = {
   updatedAt: string;
 };
 
+type OwnerScope = {
+  profileUrlHint: string;
+  returnOrigin?: string;
+};
+
+type SessionGrant = OwnerScope & {
+  v: 1;
+  grantId: string;
+  ownerSessionId: string;
+};
+
+type SessionNonce = OwnerScope & {
+  ownerSessionId: string;
+  expiresAt: number;
+};
+
 type PersistedBridgeSession = {
   schemaVersion: 1;
   session: BridgeSession;
   control: ControlState;
   targetIds: string[];
+  attachedTargetIds?: string[];
   detachedAttachment?: DetachedAttachment;
   savedAt: string;
 };
 
 type PersistedBridgeState = {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   sessions: PersistedBridgeSession[];
+  owners?: Array<{
+    ownerSessionId: string;
+    control: ControlState;
+    scope?: OwnerScope;
+  }>;
 };
 
 type QueuedControlEvent = {
@@ -145,6 +169,7 @@ const LIVE_SCREENCAST_PARAMS = {
 } as const;
 
 const DEFAULT_SESSION_RETENTION_MS = 30 * 60 * 1_000;
+const SESSION_NONCE_TTL_MS = 60_000;
 const OWNER_SESSION_ID_PATTERN = /^nex-[a-f0-9]{16}$/;
 
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
@@ -161,6 +186,10 @@ export class BridgeDaemon {
   private readonly detachedAttachments = new Map<string, DetachedAttachment>();
   private readonly attachedSessions = new Map<string, AttachedSession>();
   private readonly controlStates = new Map<string, ControlState>();
+  private readonly ownerControls = new Map<string, ControlState>();
+  private readonly ownerScopes = new Map<string, OwnerScope>();
+  private readonly sessionNonces = new Map<string, SessionNonce>();
+  private readonly usedSessionGrants = new Set<string>();
   private readonly controlEvents: QueuedControlEvent[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly cdpClients = new Map<WebSocket, string>();
@@ -177,6 +206,9 @@ export class BridgeDaemon {
       sessionRetentionMs: DEFAULT_SESSION_RETENTION_MS,
       ...options,
     };
+    if (!this.options.sessionGrantSecret || !/^[a-f0-9]{64}$/i.test(this.options.sessionGrantSecret)) {
+      throw new Error("Chrome bridge session grant secret must be a 64-character hexadecimal secret");
+    }
     this.logger = createLogger(options.logPath);
     this.loadPersistedSessions();
     this.server = createServer((req, res) => {
@@ -228,6 +260,7 @@ export class BridgeDaemon {
     await Promise.all(
       [...this.bridgeSessions.values()].map(async (session) => {
         await this.setBridgeControl(session, "stopped").catch(() => undefined);
+        if (session.ownerSessionId) this.advanceOwnerControl(session.ownerSessionId, "stopped");
         await this.closeOwnedTargets(session);
       }),
     );
@@ -280,11 +313,13 @@ export class BridgeDaemon {
         this.detachedAttachments.set(session.sessionId, attached[attached.length - 1]);
         for (const entry of attached) this.attachedSessions.delete(entry.sessionId);
       }
-      this.controlStates.set(session.sessionId, {
+      const detachedControl = {
         phase: "detached",
         epoch: (current?.epoch ?? 0) + 1,
         updatedAt: new Date().toISOString(),
-      });
+      } satisfies ControlState;
+      this.controlStates.set(session.sessionId, detachedControl);
+      if (session.ownerSessionId) this.ownerControls.set(session.ownerSessionId, detachedControl);
     }
     this.persistSessions();
     await this.closeTransport();
@@ -317,12 +352,166 @@ export class BridgeDaemon {
     };
   }
 
+  /** Public onboarding health excludes page and control-plane identities. */
+  publicStatus() {
+    const status = this.status();
+    return {
+      daemon: status.daemon,
+      version: status.version,
+      bridgeProtocolVersion: status.bridgeProtocolVersion,
+      allowedExtensionId: status.allowedExtensionId,
+      port: status.port,
+      processId: status.processId,
+      supervisedByNexolyra: status.supervisedByNexolyra,
+      profiles: status.profiles.map(({ tabs: _tabs, ...profile }) => profile),
+    };
+  }
+
+  private verifySessionGrant(value: unknown): SessionGrant | null {
+    if (typeof value !== "string" || value.length > 4096) return null;
+    const [encoded, signature, extra] = value.split(".");
+    if (!encoded || !signature || extra) return null;
+    const expected = createHmac("sha256", this.options.sessionGrantSecret!)
+      .update(encoded)
+      .digest("base64url");
+    const providedBuffer = Buffer.from(signature, "utf8");
+    const expectedBuffer = Buffer.from(expected, "utf8");
+    if (
+      providedBuffer.length !== expectedBuffer.length ||
+      !timingSafeEqual(providedBuffer, expectedBuffer)
+    ) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Record<
+        string,
+        unknown
+      >;
+      const ownerSessionId =
+        typeof parsed.ownerSessionId === "string"
+          ? validOwnerSessionId(parsed.ownerSessionId)
+          : undefined;
+      const profileUrlHint = validProfileUrlHint(parsed.profileUrlHint);
+      const returnOrigin = validReturnOrigin(parsed.returnOrigin);
+      if (
+        parsed.v !== 1 ||
+        typeof parsed.grantId !== "string" ||
+        parsed.grantId.length < 8 ||
+        parsed.grantId.length > 128 ||
+        !ownerSessionId ||
+        !profileUrlHint ||
+        (parsed.returnOrigin !== undefined && !returnOrigin)
+      ) {
+        return null;
+      }
+      return {
+        v: 1,
+        grantId: parsed.grantId,
+        ownerSessionId,
+        profileUrlHint,
+        ...(returnOrigin ? { returnOrigin } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private issueSessionNonce(grant: SessionGrant): string {
+    if (this.usedSessionGrants.has(grant.grantId)) {
+      throw new Error("Owner-scoped session grant has already been used");
+    }
+    const existingScope = this.ownerScopes.get(grant.ownerSessionId);
+    if (
+      existingScope &&
+      (existingScope.profileUrlHint !== grant.profileUrlHint ||
+        existingScope.returnOrigin !== grant.returnOrigin)
+    ) {
+      throw new Error("Owner session scope does not match the signed grant");
+    }
+    const control = this.ownerControls.get(grant.ownerSessionId);
+    if (control?.phase === "stopped") {
+      throw new Error("Owner session is stopped");
+    }
+    this.ownerScopes.set(grant.ownerSessionId, {
+      profileUrlHint: grant.profileUrlHint,
+      ...(grant.returnOrigin ? { returnOrigin: grant.returnOrigin } : {}),
+    });
+    if (!control) {
+      this.ownerControls.set(grant.ownerSessionId, {
+        phase: "agent",
+        epoch: 1,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    this.usedSessionGrants.add(grant.grantId);
+    const nonce = randomBytes(24).toString("base64url");
+    this.sessionNonces.set(nonce, {
+      ownerSessionId: grant.ownerSessionId,
+      profileUrlHint: grant.profileUrlHint,
+      ...(grant.returnOrigin ? { returnOrigin: grant.returnOrigin } : {}),
+      expiresAt: Date.now() + SESSION_NONCE_TTL_MS,
+    });
+    return nonce;
+  }
+
+  private consumeSessionNonce(value: unknown): SessionNonce | null {
+    if (typeof value !== "string" || value.length < 16 || value.length > 128) return null;
+    const nonce = this.sessionNonces.get(value);
+    this.sessionNonces.delete(value);
+    if (!nonce || nonce.expiresAt < Date.now()) return null;
+    const control = this.ownerControls.get(nonce.ownerSessionId);
+    if (!control || control.phase === "stopped") return null;
+    return nonce;
+  }
+
+  private reuseOwnerBridgeSession(
+    lease: SessionNonce,
+    control: ControlState,
+  ): BridgeSession | null {
+    const sessions = [...this.bridgeSessions.values()].filter(
+      (session) => session.ownerSessionId === lease.ownerSessionId,
+    );
+    if (sessions.length === 0) return null;
+    if (sessions.length !== 1) {
+      throw new Error("Owner session has multiple active Chrome bridge sessions");
+    }
+    const session = sessions[0];
+    const sessionControl = this.controlStates.get(session.sessionId);
+    if (
+      !sessionControl ||
+      sessionControl.phase === "stopped" ||
+      sessionControl.phase !== control.phase ||
+      sessionControl.epoch !== control.epoch ||
+      !this.sessionTargetScopes.has(session.sessionId)
+    ) {
+      throw new Error("Existing Chrome bridge session is not safe to resume");
+    }
+    if (
+      session.profileUrlHint !== lease.profileUrlHint ||
+      session.returnOrigin !== lease.returnOrigin
+    ) {
+      throw new Error("Existing Chrome bridge session scope does not match the signed grant");
+    }
+    this.logger.debug("owner-scoped Chrome bridge session reused", {
+      ownerSessionId: lease.ownerSessionId,
+      sessionId: session.sessionId,
+      phase: sessionControl.phase,
+    });
+    return { ...session };
+  }
+
   /** Register one short-lived CDP entrypoint for a browser.provider launch. */
   createBridgeSession(
     profileId?: string,
     ownerSessionId?: string,
     profileUrlHint?: string,
     returnOrigin?: string,
+    control: ControlState = {
+      phase: "agent",
+      epoch: 1,
+      updatedAt: new Date().toISOString(),
+    },
+    initialTargetIds: readonly string[] = [],
   ): BridgeSession {
     const session: BridgeSession = {
       sessionId: randomUUID(),
@@ -347,18 +536,28 @@ export class BridgeDaemon {
           attachedTargetIds: new Set(),
         });
       }
+    } else {
+      this.sessionTargetScopes.set(session.sessionId, {
+        targetIds: new Set(),
+        attachedTargetIds: new Set(initialTargetIds),
+      });
     }
-    this.controlStates.set(session.sessionId, {
-      phase: "agent",
-      epoch: 1,
-      updatedAt: new Date().toISOString(),
-    });
+    this.controlStates.set(session.sessionId, { ...control });
     this.persistSessions();
+    this.logger.debug("Chrome bridge session created", {
+      ownerSessionId: ownerSessionId ?? null,
+      sessionId: session.sessionId,
+      phase: control.phase,
+    });
     return session;
   }
 
   async detachBridgeSession(sessionId: string): Promise<boolean> {
     const session = this.bridgeSessions.get(sessionId);
+    this.logger.debug("Chrome bridge session detach requested", {
+      ownerSessionId: session?.ownerSessionId ?? null,
+      sessionId,
+    });
     if (session) {
       await this.setBridgeControl(session, "stopped");
       this.sessionTargetScopes.get(sessionId)?.attachedTargetIds.clear();
@@ -376,6 +575,33 @@ export class BridgeDaemon {
     return existed;
   }
 
+  private preserveOwnerFenceForTransportRestart(sessionId: string): boolean {
+    const session = this.bridgeSessions.get(sessionId);
+    const control = this.controlStates.get(sessionId);
+    if (
+      !session?.ownerSessionId ||
+      !control ||
+      (control.phase !== "human" &&
+        control.phase !== "detached" &&
+        control.phase !== "resuming")
+    ) {
+      return false;
+    }
+    for (const [client, bridgeSessionId] of this.cdpClients) {
+      if (bridgeSessionId !== sessionId) continue;
+      this.cdpClients.delete(client);
+      this.targetDiscoveryClients.delete(client);
+      client.close(1001, "provider transport restarting");
+    }
+    this.persistSessions();
+    this.logger.debug("Chrome bridge owner fence preserved across provider transport restart", {
+      ownerSessionId: session.ownerSessionId,
+      sessionId,
+      phase: control.phase,
+    });
+    return true;
+  }
+
   private loadPersistedSessions(): void {
     const statePath = this.options.statePath;
     if (!statePath) return;
@@ -389,8 +615,41 @@ export class BridgeDaemon {
     } catch {
       return;
     }
-    if (persisted.schemaVersion !== 1 || !Array.isArray(persisted.sessions)) return;
+    if (
+      (persisted.schemaVersion !== 1 && persisted.schemaVersion !== 2) ||
+      !Array.isArray(persisted.sessions)
+    )
+      return;
     const now = Date.now();
+    if (persisted.schemaVersion === 2 && Array.isArray(persisted.owners)) {
+      for (const owner of persisted.owners) {
+        const ownerSessionId =
+          typeof owner?.ownerSessionId === "string"
+            ? validOwnerSessionId(owner.ownerSessionId)
+            : undefined;
+        const control = owner?.control;
+        if (
+          !ownerSessionId ||
+          !control ||
+          !["agent", "human", "detached", "resuming", "stopped"].includes(control.phase) ||
+          !Number.isInteger(control.epoch) ||
+          typeof control.updatedAt !== "string"
+        ) {
+          continue;
+        }
+        this.ownerControls.set(ownerSessionId, { ...control });
+        if (owner.scope) {
+          const profileUrlHint = validProfileUrlHint(owner.scope.profileUrlHint);
+          const returnOrigin = validReturnOrigin(owner.scope.returnOrigin);
+          if (profileUrlHint) {
+            this.ownerScopes.set(ownerSessionId, {
+              profileUrlHint,
+              ...(returnOrigin ? { returnOrigin } : {}),
+            });
+          }
+        }
+      }
+    }
     for (const entry of persisted.sessions) {
       const session = entry?.session;
       const control = entry?.control;
@@ -424,9 +683,22 @@ export class BridgeDaemon {
       };
       this.bridgeSessions.set(session.sessionId, session);
       this.controlStates.set(session.sessionId, detachedControl);
+      if (!this.ownerControls.has(session.ownerSessionId)) {
+        this.ownerControls.set(session.ownerSessionId, detachedControl);
+      }
+      if (session.profileUrlHint) {
+        this.ownerScopes.set(session.ownerSessionId, {
+          profileUrlHint: session.profileUrlHint,
+          ...(session.returnOrigin ? { returnOrigin: session.returnOrigin } : {}),
+        });
+      }
       this.sessionTargetScopes.set(session.sessionId, {
         targetIds: new Set(entry.targetIds.filter((targetId) => typeof targetId === "string")),
-        attachedTargetIds: new Set(),
+        attachedTargetIds: new Set(
+          (entry.attachedTargetIds ?? []).filter(
+            (targetId): targetId is string => typeof targetId === "string",
+          ),
+        ),
       });
       if (
         entry.detachedAttachment &&
@@ -475,20 +747,30 @@ export class BridgeDaemon {
         session: { ...session },
         control: { ...control },
         targetIds: [...(this.sessionTargetScopes.get(session.sessionId)?.targetIds ?? [])],
+        attachedTargetIds: [
+          ...(this.sessionTargetScopes.get(session.sessionId)?.attachedTargetIds ?? []),
+        ],
         ...(this.detachedAttachments.has(session.sessionId)
           ? { detachedAttachment: this.detachedAttachments.get(session.sessionId) }
           : {}),
         savedAt: new Date().toISOString(),
       });
     }
-    if (sessions.length === 0) {
+    const owners = [...this.ownerControls.entries()].map(([ownerSessionId, control]) => ({
+      ownerSessionId,
+      control: { ...control },
+      ...(this.ownerScopes.has(ownerSessionId)
+        ? { scope: { ...this.ownerScopes.get(ownerSessionId)! } }
+        : {}),
+    }));
+    if (sessions.length === 0 && owners.length === 0) {
       rmSync(statePath, { force: true });
       return;
     }
     mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
     const staged = `${statePath}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(staged, `${JSON.stringify({ schemaVersion: 1, sessions })}\n`, {
+      writeFileSync(staged, `${JSON.stringify({ schemaVersion: 2, sessions, owners })}\n`, {
         encoding: "utf8",
         mode: 0o600,
       });
@@ -507,6 +789,13 @@ export class BridgeDaemon {
     // needs the separately allowlisted, read-only health route below.
     if (url.pathname !== "/health" && req.headers.origin) {
       this.writeJson(res, 403, { error: "browser-origin requests are not allowed" });
+      return;
+    }
+    if (
+      (url.pathname === "/control" || url.pathname.startsWith("/control/")) &&
+      !this.hasValidControlToken(req)
+    ) {
+      this.writeJson(res, 401, { error: "Nexolyra control authentication is required" });
       return;
     }
     if (req.method === "OPTIONS" && url.pathname === "/health") {
@@ -528,11 +817,63 @@ export class BridgeDaemon {
       return;
     }
     if (req.method === "GET" && url.pathname === "/health") {
-      this.writeJson(res, 200, this.status(), this.healthCorsHeaders(req) ?? undefined);
+      this.writeJson(res, 200, this.publicStatus(), this.healthCorsHeaders(req) ?? undefined);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/control/status") {
+      this.writeJson(res, 200, this.status());
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session-leases") {
+      const body = await readJsonBody(req);
+      const grant = this.verifySessionGrant(body.grant);
+      if (!grant) {
+        this.writeJson(res, 400, { error: "A valid owner-scoped session grant is required" });
+        return;
+      }
+      try {
+        this.writeJson(res, 200, {
+          nonce: this.issueSessionNonce(grant),
+          expiresInMs: SESSION_NONCE_TTL_MS,
+        });
+      } catch (error) {
+        this.writeJson(res, 409, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
     if (req.method === "POST" && url.pathname === "/sessions") {
       const body = await readJsonBody(req);
+      if (!this.hasValidControlToken(req)) {
+        const lease = this.consumeSessionNonce(body.nonce);
+        if (!lease) {
+          this.writeJson(res, 401, { error: "A fresh owner-scoped session nonce is required" });
+          return;
+        }
+        const control = this.ownerControls.get(lease.ownerSessionId);
+        if (!control) {
+          this.writeJson(res, 409, { error: "Owner control state is unavailable" });
+          return;
+        }
+        try {
+          const session =
+            this.reuseOwnerBridgeSession(lease, control) ??
+            this.createBridgeSession(
+              undefined,
+              lease.ownerSessionId,
+              lease.profileUrlHint,
+              lease.returnOrigin,
+              control,
+            );
+          this.writeJson(res, 200, session);
+        } catch (error) {
+          this.writeJson(res, 409, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
       const profileId =
         typeof body.profileId === "string" && body.profileId ? body.profileId : undefined;
       const profileUrlHint = validProfileUrlHint(body.profileUrlHint);
@@ -554,11 +895,50 @@ export class BridgeDaemon {
         OWNER_SESSION_ID_PATTERN.test(body.ownerSessionId)
           ? body.ownerSessionId
           : undefined;
+      if (!ownerSessionId) {
+        this.writeJson(res, 400, { error: "ownerSessionId is required" });
+        return;
+      }
+      const existingControl = this.ownerControls.get(ownerSessionId);
+      if (existingControl?.phase === "stopped") {
+        this.writeJson(res, 409, { error: "Owner session is stopped" });
+        return;
+      }
+      const control =
+        existingControl ??
+        ({ phase: "agent", epoch: 1, updatedAt: new Date().toISOString() } satisfies ControlState);
+      this.ownerControls.set(ownerSessionId, control);
+      if (profileUrlHint) {
+        this.ownerScopes.set(ownerSessionId, {
+          profileUrlHint,
+          ...(returnOrigin ? { returnOrigin } : {}),
+        });
+      }
+      const requestedTargetIds = Array.isArray(body.targetIds)
+        ? body.targetIds.filter((value): value is string => typeof value === "string")
+        : null;
+      if (Array.isArray(body.targetIds) && requestedTargetIds?.length !== body.targetIds.length) {
+        this.writeJson(res, 400, { error: "targetIds must contain only target identities" });
+        return;
+      }
+      const initialTargetIds =
+        requestedTargetIds ??
+        (profileUrlHint
+          ? []
+          : [...this.profiles.values()]
+              .filter((peer) => !profileId || peer.profileId === profileId)
+              .flatMap((peer) =>
+                [...peer.tabs.values()]
+                  .filter(shouldExposeTab)
+                  .map((tab) => targetIdFor(peer.profileId, tab.tabId)),
+              ));
       const session = this.createBridgeSession(
         profileId,
         ownerSessionId,
         profileUrlHint,
         returnOrigin,
+        control,
+        initialTargetIds,
       );
       this.writeJson(res, 200, session);
       return;
@@ -651,10 +1031,38 @@ export class BridgeDaemon {
         this.writeJson(res, 400, { error: "bridge session id is invalid" });
         return;
       }
+      const hostAuthorized = this.hasValidControlToken(req);
+      const sessionAuthorized = this.hasValidSessionToken(req, sessionId);
+      if (!hostAuthorized && !sessionAuthorized) {
+        this.writeJson(res, 401, { error: "Bridge session authentication is required" });
+        return;
+      }
+      if (!hostAuthorized && this.preserveOwnerFenceForTransportRestart(sessionId)) {
+        this.writeJson(res, 200, { detached: false, preserved: true });
+        return;
+      }
       this.writeJson(res, 200, { detached: await this.detachBridgeSession(sessionId) });
       return;
     }
     this.writeJson(res, 404, { error: "not found" });
+  }
+
+  private hasValidControlToken(req: IncomingMessage): boolean {
+    if (!this.options.controlToken) return false;
+    const authorization = req.headers.authorization;
+    if (!authorization?.startsWith("Bearer ")) return false;
+    const provided = Buffer.from(authorization.slice("Bearer ".length), "utf8");
+    const expected = Buffer.from(this.options.controlToken, "utf8");
+    return provided.length === expected.length && timingSafeEqual(provided, expected);
+  }
+
+  private hasValidSessionToken(req: IncomingMessage, sessionId: string): boolean {
+    const session = this.bridgeSessions.get(sessionId);
+    const authorization = req.headers.authorization;
+    if (!session || !authorization?.startsWith("Bearer ")) return false;
+    const provided = Buffer.from(authorization.slice("Bearer ".length), "utf8");
+    const expected = Buffer.from(session.token, "utf8");
+    return provided.length === expected.length && timingSafeEqual(provided, expected);
   }
 
   private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
@@ -904,7 +1312,7 @@ export class BridgeDaemon {
       return {
         handled: true,
         result: {
-          targetInfos: this.tabsForSession(bridgeSession, peer)
+          targetInfos: this.tabsForCdpDiscovery(bridgeSession, peer)
             .filter(shouldExposeTab)
             .map((tab) =>
               targetInfoFor(
@@ -960,6 +1368,13 @@ export class BridgeDaemon {
             entry.tabId === ref.tabId,
         );
         if (!existing) {
+          this.logger.error("semantic readback target did not match a preserved attachment", {
+            bridgeSessionId: bridgeSession.sessionId,
+            requestedTargetId: targetId,
+            preservedTargetIds: [...this.attachedSessions.values()]
+              .filter((entry) => entry.bridgeSessionId === bridgeSession.sessionId)
+              .map((entry) => targetIdFor(entry.profileId, entry.tabId)),
+          });
           throw new Error("Semantic readback can attach only to the reconnected task tab");
         }
         return { handled: true, result: { sessionId: existing.sessionId } };
@@ -1156,6 +1571,11 @@ export class BridgeDaemon {
         tolerateFocusFailure: message.action === "takeover",
       },
     );
+    this.advanceOwnerControl(
+      bridgeSession.ownerSessionId,
+      message.action === "takeover" ? "human" : "stopped",
+    );
+    this.persistSessions();
     this.enqueueControlEvent({
       ownerSessionId: bridgeSession.ownerSessionId,
       bridgeSessionId: bridgeSession.sessionId,
@@ -1181,6 +1601,9 @@ export class BridgeDaemon {
     const pendingActionRisk = [...this.pending.values()].some(
       (pending) => pending.bridgeSessionId === bridgeSession.sessionId,
     );
+    if (reason === "tab_closed") {
+      this.forgetClosedTab(profileId, tabId);
+    }
     this.detachedAttachments.set(bridgeSession.sessionId, {
       sessionId: attached.sessionId,
       profileId: attached.profileId,
@@ -1190,6 +1613,7 @@ export class BridgeDaemon {
       targetIdFor(attached.profileId, attached.tabId),
     );
     await this.setBridgeControl(bridgeSession, "detached");
+    this.advanceOwnerControl(bridgeSession.ownerSessionId, "detached");
     this.attachedSessions.delete(attached.sessionId);
     this.enqueueControlEvent({
       ownerSessionId: bridgeSession.ownerSessionId,
@@ -1201,6 +1625,25 @@ export class BridgeDaemon {
       pendingActionRisk,
     });
     this.persistSessions();
+  }
+
+  /**
+   * A chrome.debugger detach notification can arrive before the next tab
+   * heartbeat. Remove an explicitly closed tab immediately so a reconnecting
+   * native client cannot rediscover and select that stale target during the
+   * semantic-readback window.
+   */
+  private forgetClosedTab(profileId: string, tabId: number): void {
+    this.profiles.get(profileId)?.tabs.delete(tabId);
+    const targetId = targetIdFor(profileId, tabId);
+    for (const [bridgeSessionId, scope] of this.sessionTargetScopes) {
+      const ownedRemoved = scope.targetIds.delete(targetId);
+      const attachedRemoved = scope.attachedTargetIds.delete(targetId);
+      const removed = ownedRemoved || attachedRemoved;
+      if (removed && this.controlStates.get(bridgeSessionId)?.phase !== "stopped") {
+        this.broadcastTargetEvent(bridgeSessionId, "Target.targetDestroyed", { targetId });
+      }
+    }
   }
 
   /**
@@ -1407,6 +1850,8 @@ export class BridgeDaemon {
         );
       }
       await this.setBridgeControl(session, "resuming");
+      this.advanceOwnerControl(ownerSessionId, "resuming");
+      this.persistSessions();
       return {
         matched: sessions.length,
         attached: true,
@@ -1426,6 +1871,7 @@ export class BridgeDaemon {
       previous?.sessionId ?? sessionIdFor(target.tab.tabId, this.attachSequence++);
     try {
       await this.setBridgeControl(session, "resuming");
+      this.advanceOwnerControl(ownerSessionId, "resuming");
       this.attachedSessions.set(attachedSessionId, {
         sessionId: attachedSessionId,
         bridgeSessionId: session.sessionId,
@@ -1450,6 +1896,7 @@ export class BridgeDaemon {
         epoch: Math.max(current?.epoch ?? 0, previousControl?.epoch ?? 0) + 1,
         updatedAt: new Date().toISOString(),
       });
+      if (previousControl) this.ownerControls.set(ownerSessionId, { ...previousControl });
       try {
         this.persistSessions();
       } catch {
@@ -1489,6 +1936,7 @@ export class BridgeDaemon {
     ownerSessionId: string,
     phase: ControlPhase,
   ): Promise<{ matched: number; focusConfirmed: boolean }> {
+    this.advanceOwnerControl(ownerSessionId, phase);
     const sessions = [...this.bridgeSessions.values()].filter(
       (session) => session.ownerSessionId === ownerSessionId,
     );
@@ -1509,10 +1957,23 @@ export class BridgeDaemon {
         focusConfirmed = focusConfirmed && focused;
       }
     }
+    this.persistSessions();
     return {
       matched: sessions.length,
       focusConfirmed: phase === "human" ? focusAttempted && focusConfirmed : focusConfirmed,
     };
+  }
+
+  private advanceOwnerControl(ownerSessionId: string, phase: ControlPhase): ControlState {
+    const current = this.ownerControls.get(ownerSessionId);
+    if (current?.phase === phase && phase !== "human") return current;
+    const next = {
+      phase,
+      epoch: (current?.epoch ?? 0) + 1,
+      updatedAt: new Date().toISOString(),
+    } satisfies ControlState;
+    this.ownerControls.set(ownerSessionId, next);
+    return next;
   }
 
   private async setBridgeControl(
@@ -1724,6 +2185,23 @@ export class BridgeDaemon {
       .map((targetId) => parseTargetId(targetId))
       .filter((ref) => ref?.profileId === peer.profileId)
       .map((ref) => peer.tabs.get(ref!.tabId))
+      .filter((tab): tab is BridgeTab => Boolean(tab));
+  }
+
+  private tabsForCdpDiscovery(session: BridgeSession, peer: ProfilePeer): BridgeTab[] {
+    if (this.controlStates.get(session.sessionId)?.phase !== "resuming") {
+      return this.tabsForSession(session, peer);
+    }
+    // A fresh native transport may remember several tabs owned before the
+    // takeover. During readback expose only the exact attachment selected by
+    // the host's reconnect gate, otherwise native target selection can sample
+    // a sibling tab that the user did not approve for this handoff.
+    return [...this.attachedSessions.values()]
+      .filter(
+        (attached) =>
+          attached.bridgeSessionId === session.sessionId && attached.profileId === peer.profileId,
+      )
+      .map((attached) => peer.tabs.get(attached.tabId))
       .filter((tab): tab is BridgeTab => Boolean(tab));
   }
 

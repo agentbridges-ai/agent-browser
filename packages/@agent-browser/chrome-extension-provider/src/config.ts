@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { closeSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -12,11 +13,36 @@ export type BridgeConfig = {
   returnOrigin?: string;
   daemonCommand?: string;
   extensionId?: string;
+  controlToken?: string;
+  controlSecretsFd?: number;
+  sessionGrant?: string;
+  sessionGrantSecret?: string;
   logPath?: string;
   statePath?: string;
   legacyStatePaths: string[];
   supervisedByNexolyra: boolean;
 };
+
+export function readControlSecretsFd(fd: number): {
+  controlToken: string;
+  sessionGrantSecret: string;
+} {
+  try {
+    const secrets = JSON.parse(readFileSync(fd, "utf8")) as Record<string, unknown>;
+    const controlToken = parseControlToken(
+      typeof secrets.controlToken === "string" ? secrets.controlToken : undefined,
+    );
+    const sessionGrantSecret = parseSessionGrantSecret(
+      typeof secrets.sessionGrantSecret === "string" ? secrets.sessionGrantSecret : undefined,
+    );
+    if (!controlToken || !sessionGrantSecret) {
+      throw new Error("Control fd did not contain both required Chrome bridge secrets");
+    }
+    return { controlToken, sessionGrantSecret };
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   const logPath = nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG);
@@ -41,12 +67,59 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
     extensionId:
       parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID) ??
       PINNED_CHROME_EXTENSION_ID,
+    controlToken: parseControlToken(env.NEXOLYRA_AGENT_BROWSER_CONTROL_TOKEN),
+    controlSecretsFd: parseControlSecretsFd(env.NEXOLYRA_AGENT_BROWSER_CONTROL_FD),
+    sessionGrant: parseSessionGrant(env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT),
+    sessionGrantSecret: parseSessionGrantSecret(
+      env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT_SECRET,
+    ),
     logPath,
     statePath,
     legacyStatePaths:
       explicitStatePath || legacyStatePath === statePath ? [] : [legacyStatePath],
     supervisedByNexolyra: env.NEXOLYRA_AGENT_BROWSER_DAEMON_SUPERVISED === "1",
   };
+}
+
+export function parseControlSecretsFd(value: string | undefined): number | undefined {
+  const candidate = nonEmpty(value);
+  if (!candidate) return undefined;
+  const fd = Number(candidate);
+  if (!Number.isSafeInteger(fd) || fd < 3 || fd > 255) {
+    throw new Error("NEXOLYRA_AGENT_BROWSER_CONTROL_FD must be an inherited fd from 3 to 255");
+  }
+  return fd;
+}
+
+export function parseSessionGrant(value: string | undefined): string | undefined {
+  const grant = nonEmpty(value);
+  if (!grant) return undefined;
+  if (grant.length > 4096 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(grant)) {
+    throw new Error("NEXOLYRA_AGENT_BROWSER_SESSION_GRANT is malformed");
+  }
+  return grant;
+}
+
+export function parseSessionGrantSecret(value: string | undefined): string | undefined {
+  const secret = nonEmpty(value);
+  if (!secret) return undefined;
+  if (!/^[a-f0-9]{64}$/i.test(secret)) {
+    throw new Error(
+      "NEXOLYRA_AGENT_BROWSER_SESSION_GRANT_SECRET must be a 64-character hexadecimal secret",
+    );
+  }
+  return secret;
+}
+
+export function parseControlToken(value: string | undefined): string | undefined {
+  const token = nonEmpty(value);
+  if (!token) return undefined;
+  if (!/^[a-f0-9]{64}$/i.test(token)) {
+    throw new Error(
+      "NEXOLYRA_AGENT_BROWSER_CONTROL_TOKEN must be a 64-character hexadecimal secret",
+    );
+  }
+  return token;
 }
 
 export function parseExtensionId(value: string | undefined): string | undefined {

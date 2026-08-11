@@ -1,12 +1,70 @@
 import assert from "node:assert/strict";
+import { createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
-import { parseExtensionId, readBridgeConfig } from "../dist/config.js";
+import { parseExtensionId, readBridgeConfig, readControlSecretsFd } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
+
+const TEST_CONTROL_TOKEN = "a".repeat(64);
+const TEST_SESSION_GRANT_SECRET = "b".repeat(64);
+
+test("control secrets fd is consumed once and closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-control-fd-"));
+  const path = join(root, "secrets.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      controlToken: TEST_CONTROL_TOKEN,
+      sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+    }),
+  );
+  const fd = openSync(path, "r");
+  try {
+    assert.deepEqual(readControlSecretsFd(fd), {
+      controlToken: TEST_CONTROL_TOKEN,
+      sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+    });
+    assert.throws(() => fstatSync(fd), /bad file descriptor/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function createDaemon(options) {
+  return new BridgeDaemon({
+    controlToken: TEST_CONTROL_TOKEN,
+    sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+    ...options,
+  });
+}
+
+function controlHeaders(headers = {}) {
+  return { authorization: `Bearer ${TEST_CONTROL_TOKEN}`, ...headers };
+}
+
+function sessionGrant({
+  ownerSessionId = "nex-aaaaaaaaaaaaaaaa",
+  profileUrlHint = "/session/test-session",
+  returnOrigin = "http://127.0.0.1:3458",
+} = {}) {
+  const encoded = Buffer.from(
+    JSON.stringify({
+      v: 1,
+      grantId: randomUUID(),
+      ownerSessionId,
+      ...(profileUrlHint ? { profileUrlHint } : {}),
+      returnOrigin,
+    }),
+  ).toString("base64url");
+  const signature = createHmac("sha256", TEST_SESSION_GRANT_SECRET)
+    .update(encoded)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
 
 test("extension allowlist configuration accepts only canonical Chrome ids", () => {
   assert.equal(parseExtensionId(undefined), undefined);
@@ -76,7 +134,7 @@ test("daemon atomically migrates a valid legacy state file to the fixed state pa
     })}\n`,
     { encoding: "utf8" },
   );
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port: await freePort(),
     statePath,
     legacyStatePaths: [legacyStatePath],
@@ -95,7 +153,7 @@ test("daemon atomically migrates a valid legacy state file to the fixed state pa
 
 test("daemon validates CDP tokens and routes core CDP traffic through the extension bridge", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     supervisedByNexolyra: true,
@@ -106,7 +164,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
   ]);
 
   try {
-    const health = await fetchJson(port, "/health");
+    const health = await fetchJson(port, "/control/status");
     assert.equal(health.supervisedByNexolyra, true);
     assert.equal(health.processId, process.pid);
     await assertInvalidToken(port);
@@ -159,7 +217,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
       extension.commands.some(
         (command) =>
           command.method === "Page.captureScreenshot" &&
-          command.tabId === 202 &&
+          command.tabId === 303 &&
           command.params.format === "jpeg" &&
           command.params.quality === 60 &&
           command.params.fromSurface === true,
@@ -202,7 +260,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
 
 test("daemon prevents another bridge session from attaching an already controlled tab", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -210,7 +268,9 @@ test("daemon prevents another bridge session from attaching an already controlle
 
   try {
     const ownerSession = await postJson(port, "/sessions", {});
-    const otherSession = await postJson(port, "/sessions", {});
+    const otherSession = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-bbbbbbbbbbbbbbbb",
+    });
     const ownerCdp = await connectCdp(port, ownerSession.sessionId, ownerSession.token);
     const otherCdp = await connectCdp(port, otherSession.sessionId, otherSession.token);
 
@@ -299,7 +359,7 @@ test("daemon prevents another bridge session from attaching an already controlle
 test("daemon accepts only the pinned Chrome extension origin and identity", async () => {
   const extensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
   const port = await freePort();
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     allowedExtensionId: extensionId,
@@ -365,7 +425,7 @@ test("daemon accepts only the pinned Chrome extension origin and identity", asyn
 
 test("malformed HTTP route encoding cannot terminate the bridge daemon", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
 
   try {
@@ -377,7 +437,9 @@ test("malformed HTTP route encoding cannot terminate the bridge daemon", async (
     ]) {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method: path.endsWith("/targets") ? "GET" : "POST",
-        headers: { "content-type": "application/json" },
+        headers: path.startsWith("/control")
+          ? controlHeaders({ "content-type": "application/json" })
+          : { "content-type": "application/json" },
         body: path.endsWith("/targets") ? undefined : "{}",
       });
       assert.equal(response.status, 400);
@@ -392,7 +454,7 @@ test("malformed HTTP route encoding cannot terminate the bridge daemon", async (
 
 test("daemon rejects browser-origin control requests before they can mutate sessions", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
 
   try {
@@ -405,15 +467,337 @@ test("daemon rejects browser-origin control requests before they can mutate sess
       body: "{}",
     });
     assert.equal(response.status, 403);
-    assert.equal((await fetchJson(port, "/health")).sessions.length, 0);
+    assert.equal((await fetchJson(port, "/control/status")).sessions.length, 0);
   } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon rejects a host control phase flip without the Nexolyra control token", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    controlToken: TEST_CONTROL_TOKEN,
+  });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    const takeover = await fetch(
+      `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_CONTROL_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ phase: "human" }),
+      },
+    );
+    assert.equal(takeover.status, 200);
+
+    const unauthorizedFlip = await fetch(
+      `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ phase: "agent" }),
+      },
+    );
+    assert.equal(unauthorizedFlip.status, 401);
+
+    const mutation = await cdpCommand(cdp, {
+      id: 2,
+      sessionId: attached.result.sessionId,
+      method: "Runtime.evaluate",
+      params: { expression: "document.body.dataset.compromised = 'true'" },
+    });
+    assert.match(mutation.error?.message || "", /held by the user|human/i);
+    assert.equal(
+      extension.commands.some(
+        (command) =>
+          command.method === "Runtime.evaluate" &&
+          command.params.expression?.includes("compromised"),
+      ),
+      false,
+    );
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("daemon rejects anonymous, ownerless, and unscoped session minting", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    const anonymous = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(anonymous.status, 401);
+
+    const ownerless = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: controlHeaders({ "content-type": "application/json" }),
+      body: "{}",
+    });
+    assert.equal(ownerless.status, 400);
+
+    const unscopedLease = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: sessionGrant({ profileUrlHint: null }) }),
+    });
+    assert.equal(unscopedLease.status, 400);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("one-time session nonce inherits human control and cannot be replayed", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    {
+      tabId: 101,
+      windowId: 1,
+      url: "http://127.0.0.1:3458/session/test-session",
+      title: "Nexolyra",
+      active: true,
+    },
+  ]);
+
+  try {
+    const grant = sessionGrant();
+    const lease = await postJson(port, "/session-leases", { grant });
+    const reusedGrant = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant }),
+    });
+    assert.equal(reusedGrant.status, 409);
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "human" });
+    const minted = await postJson(port, "/sessions", { nonce: lease.nonce });
+    const controlStatus = await fetchJson(port, "/control/status");
+    assert.equal(controlStatus.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
+    assert.equal(controlStatus.sessions[0].control.phase, "human");
+
+    const replay = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce: lease.nonce }),
+    });
+    assert.equal(replay.status, 401);
+
+    const cdp = await connectCdp(port, minted.sessionId, minted.token);
+    const mutation = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.createTarget",
+      params: { url: "https://example.com" },
+    });
+    assert.match(mutation.error?.message || "", /held by the user|human/i);
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("owner-scoped session resume fails closed for ambiguous or mismatched existing sessions", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    await postJson(port, "/sessions", {
+      profileUrlHint: "/session/test-session",
+      returnOrigin: "http://127.0.0.1:3458",
+    });
+    await postJson(port, "/sessions", {
+      profileUrlHint: "/session/test-session",
+      returnOrigin: "http://127.0.0.1:3458",
+    });
+    const lease = await postJson(port, "/session-leases", { grant: sessionGrant() });
+    const ambiguous = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce: lease.nonce }),
+    });
+    assert.equal(ambiguous.status, 409);
+    assert.match((await ambiguous.json()).error, /multiple active/i);
+
+    const mismatched = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        grant: sessionGrant({ profileUrlHint: "/session/different-session" }),
+      }),
+    });
+    assert.equal(mismatched.status, 409);
+    assert.match((await mismatched.json()).error, /scope does not match/i);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("a daemon restart preserves an owner fence before accepting a stale signed grant", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-owner-fence-"));
+  const statePath = join(root, "sessions.json");
+  const grant = sessionGrant();
+  const firstPort = await freePort();
+  const first = createDaemon({ port: firstPort, statePath, commandTimeoutMs: 5000 });
+  await first.start();
+  try {
+    const lease = await postJson(firstPort, "/session-leases", { grant });
+    assert.equal(typeof lease.nonce, "string");
+    await postJson(firstPort, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "human" });
+    await first.shutdown();
+  } catch (error) {
+    await first.stop().catch(() => undefined);
+    throw error;
+  }
+
+  const secondPort = await freePort();
+  const second = createDaemon({ port: secondPort, statePath, commandTimeoutMs: 5000 });
+  await second.start();
+  try {
+    const lease = await postJson(secondPort, "/session-leases", { grant });
+    const session = await postJson(secondPort, "/sessions", { nonce: lease.nonce });
+    const status = await fetchJson(secondPort, "/control/status");
+    assert.equal(status.sessions.find((candidate) => candidate.sessionId === session.sessionId).control.phase, "human");
+  } finally {
+    await second.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session detach requires either host control or the matching bridge token", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      targetIds: [],
+    });
+    const anonymous = await fetch(
+      `http://127.0.0.1:${port}/sessions/${encodeURIComponent(session.sessionId)}/detach`,
+      { method: "POST" },
+    );
+    assert.equal(anonymous.status, 401);
+    const self = await fetch(
+      `http://127.0.0.1:${port}/sessions/${encodeURIComponent(session.sessionId)}/detach`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${session.token}` },
+      },
+    );
+    assert.equal(self.status, 200);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("a provider transport restart preserves a resuming owner attachment", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const initialLease = await postJson(port, "/session-leases", { grant: sessionGrant() });
+    const session = await postJson(port, "/sessions", { nonce: initialLease.nonce });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.createTarget",
+      params: { url: "https://example.com/task" },
+    });
+    const attachment = await cdpCommand(cdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: attached.result.targetId, flatten: true },
+    });
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "resuming" });
+
+    const transportClose = await fetch(
+      `http://127.0.0.1:${port}/sessions/${encodeURIComponent(session.sessionId)}/detach`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${session.token}` },
+      },
+    );
+    assert.equal(transportClose.status, 200);
+    assert.deepEqual(await transportClose.json(), { detached: false, preserved: true });
+
+    const resumedLease = await postJson(port, "/session-leases", { grant: sessionGrant() });
+    const resumed = await postJson(port, "/sessions", { nonce: resumedLease.nonce });
+    assert.equal(resumed.sessionId, session.sessionId);
+    assert.equal(resumed.token, session.token);
+    const resumedCdp = await connectCdp(port, resumed.sessionId, resumed.token);
+    const resumedAttachment = await cdpCommand(resumedCdp, {
+      id: 3,
+      method: "Target.attachToTarget",
+      params: { targetId: attached.result.targetId, flatten: true },
+    });
+    assert.equal(resumedAttachment.result.sessionId, attachment.result.sessionId);
+    assert.equal((await fetchJson(port, "/control/status")).sessions.length, 1);
+    resumedCdp.close();
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("public health redacts session ownership and tab details", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://private.example", title: "Private", active: true },
+  ]);
+
+  try {
+    await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      targetIds: ["tab:profile-a:101"],
+    });
+    const health = await fetchJson(port, "/health");
+    assert.equal("sessions" in health, false);
+    assert.equal("tabs" in health.profiles[0], false);
+    const controlStatus = await fetchJson(port, "/control/status");
+    assert.equal(controlStatus.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
+  } finally {
+    extension.close();
     await daemon.stop();
   }
 });
 
 test("daemon requires an explicit profile when multiple extension profiles are connected", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const first = await connectExtension(port, "profile-a", [
     { tabId: 1, url: "https://a.example", title: "A", active: true },
@@ -441,7 +825,7 @@ test("daemon requires an explicit profile when multiple extension profiles are c
 
 test("daemon selects the owning profile and isolates a host session in its own task window", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     detachedTargetGraceMs: 50,
@@ -518,7 +902,7 @@ test("daemon selects the owning profile and isolates a host session in its own t
       targets.result.targetInfos.map((target) => target.url),
       ["https://example.com/task"],
     );
-    const health = await fetchJson(port, "/health");
+    const health = await fetchJson(port, "/control/status");
     assert.equal(health.sessions[0].profileId, "profile-b");
     assert.equal("profileUrlHint" in health.sessions[0], false);
 
@@ -598,7 +982,7 @@ test("daemon selects the owning profile and isolates a host session in its own t
 
 test("daemon preserves the multiple-profile error when a route hint is ambiguous", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const first = await connectExtension(port, "profile-a", [
     { tabId: 1, url: "https://a.example/session/shared", title: "A", active: true },
@@ -626,7 +1010,7 @@ test("daemon preserves the multiple-profile error when a route hint is ambiguous
 
 test("page takeover fences queued and future CDP commands and emits a bounded owner event", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -724,7 +1108,7 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
 
 test("external tab detachment is recoverable and does not become user Stop", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -768,14 +1152,14 @@ test("external tab detachment is recoverable and does not become user Stop", asy
       pendingActionRisk: false,
       createdAt: events.events[0].createdAt,
     });
-    const health = await fetchJson(port, "/health");
+    const health = await fetchJson(port, "/control/status");
     assert.equal(health.sessions[0].control.phase, "detached");
 
     const reenabled = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
       phase: "agent",
     });
     assert.equal(reenabled.matched, 1);
-    const afterReenable = await fetchJson(port, "/health");
+    const afterReenable = await fetchJson(port, "/control/status");
     assert.equal(afterReenable.sessions[0].control.phase, "agent");
     cdp.close();
   } finally {
@@ -786,18 +1170,17 @@ test("external tab detachment is recoverable and does not become user Stop", asy
 
 test("reconnect enters readback-only control and preserves the CDP attachment id", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
   ]);
 
   try {
-    const session = await postJson(port, "/sessions", {
-      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
-      profileUrlHint: "/session/session-a",
-      returnOrigin: "http://127.0.0.1:3458",
+    const initialLease = await postJson(port, "/session-leases", {
+      grant: sessionGrant({ profileUrlHint: "/session/session-a" }),
     });
+    const session = await postJson(port, "/sessions", { nonce: initialLease.nonce });
     const cdp = await connectCdp(port, session.sessionId, session.token);
     const attached = await cdpCommand(cdp, {
       id: 1,
@@ -810,6 +1193,35 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
       params: { targetId: attached.result.targetId, flatten: true },
     });
     const oldAttachmentId = attachment.result.sessionId;
+    const siblingTargetId = "tab:profile-a:404";
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 303,
+            windowId: 99,
+            url: "https://example.com/task",
+            title: "Task",
+            active: true,
+          },
+          {
+            tabId: 404,
+            windowId: 99,
+            openerTabId: 303,
+            url: "https://example.com/sibling",
+            title: "Sibling",
+            active: false,
+          },
+        ],
+      }),
+    );
+    await waitFor(async () => {
+      const targets = await cdpCommand(cdp, { id: 3, method: "Target.getTargets", params: {} });
+      return targets.result.targetInfos.some((target) => target.targetId === siblingTargetId);
+    });
     extension.send(
       JSON.stringify({
         v: 1,
@@ -821,6 +1233,17 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
       }),
     );
     await waitFor(async () => (await fetchJson(port, "/control/events?after=0")).events.length === 1);
+
+    const targetsAfterClosedTab = await cdpCommand(cdp, {
+      id: 4,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.deepEqual(
+      targetsAfterClosedTab.result.targetInfos.map((target) => target.targetId),
+      [siblingTargetId],
+      "an explicit tab_closed event must remove the stale target before the next heartbeat",
+    );
 
     extension.send(
       JSON.stringify({
@@ -834,6 +1257,14 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
             url: "http://127.0.0.1:3458/workspace/it/session/session-a",
             title: "Nexolyra",
             active: true,
+          },
+          {
+            tabId: 404,
+            windowId: 2,
+            openerTabId: 303,
+            url: "https://example.com/sibling",
+            title: "Sibling",
+            active: false,
           },
         ],
       }),
@@ -857,32 +1288,53 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
           command.params.returnOrigin === undefined,
       ),
     );
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "resuming");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "resuming");
 
-    const targets = await cdpCommand(cdp, { id: 2, method: "Target.getTargets", params: {} });
+    cdp.close();
+    const resumedLease = await postJson(port, "/session-leases", {
+      grant: sessionGrant({ profileUrlHint: "/session/session-a" }),
+    });
+    const resumedSession = await postJson(port, "/sessions", { nonce: resumedLease.nonce });
+    assert.equal(resumedSession.sessionId, session.sessionId);
+    assert.equal(resumedSession.token, session.token);
+    const resumedStatus = await fetchJson(port, "/control/status");
+    assert.equal(resumedStatus.sessions.length, 1);
+    const resumedCdp = await connectCdp(port, resumedSession.sessionId, resumedSession.token);
+    const resumedAttachment = await cdpCommand(resumedCdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:202", flatten: true },
+    });
+    assert.equal(resumedAttachment.result.sessionId, oldAttachmentId);
+
+    const targets = await cdpCommand(resumedCdp, {
+      id: 3,
+      method: "Target.getTargets",
+      params: {},
+    });
     assert.deepEqual(
       targets.result.targetInfos.map((target) => target.targetId),
       ["tab:profile-a:202"],
     );
 
-    const mutating = await cdpCommand(cdp, {
-      id: 3,
+    const mutating = await cdpCommand(resumedCdp, {
+      id: 4,
       sessionId: oldAttachmentId,
       method: "Runtime.evaluate",
       params: { expression: "document.body.textContent = 'changed'" },
     });
     assert.match(mutating.error.message, /semantic readback only/);
 
-    const rendererProbe = await cdpCommand(cdp, {
-      id: 4,
+    const rendererProbe = await cdpCommand(resumedCdp, {
+      id: 5,
       sessionId: oldAttachmentId,
       method: "Runtime.evaluate",
       params: { expression: "1", returnByValue: true },
     });
     assert.equal(rendererProbe.result.result.value, "ok");
 
-    const semanticReadback = await cdpCommand(cdp, {
-      id: 5,
+    const semanticReadback = await cdpCommand(resumedCdp, {
+      id: 6,
       sessionId: oldAttachmentId,
       method: "Accessibility.getFullAXTree",
       params: {},
@@ -890,14 +1342,14 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
     assert.equal(semanticReadback.result.result.value, "ok");
 
     await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "agent" });
-    const afterHandoff = await cdpCommand(cdp, {
-      id: 6,
+    const afterHandoff = await cdpCommand(resumedCdp, {
+      id: 7,
       sessionId: oldAttachmentId,
       method: "Runtime.evaluate",
       params: { expression: "document.title" },
     });
     assert.equal(afterHandoff.result.result.value, "ok");
-    cdp.close();
+    resumedCdp.close();
   } finally {
     extension.close();
     await daemon.stop();
@@ -906,7 +1358,7 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
 
 test("reconnect never auto-selects a unique or active target without an explicit id", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -933,21 +1385,21 @@ test("reconnect never auto-selects a unique or active target without an explicit
       }),
     );
     await waitFor(
-      async () => (await fetchJson(port, "/health")).sessions[0].control.phase === "detached",
+      async () => (await fetchJson(port, "/control/status")).sessions[0].control.phase === "detached",
     );
 
     const response = await fetch(
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: "{}",
       },
     );
     assert.equal(response.status, 409);
     const payload = await response.json();
     assert.match(payload.error, /explicit targetId/);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "detached");
     cdp.close();
   } finally {
     extension.close();
@@ -957,7 +1409,7 @@ test("reconnect never auto-selects a unique or active target without an explicit
 
 test("reconnect cannot silently replace an existing task tab with a requested target", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://one.example", title: "One", active: true },
@@ -980,13 +1432,13 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ targetId: "tab:profile-a:202" }),
       },
     );
     assert.equal(mismatched.status, 409);
     assert.match((await mismatched.json()).error, /already attached to a different/);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "human");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "human");
 
     const resumed = await postJson(
       port,
@@ -995,7 +1447,7 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
     );
     assert.equal(resumed.targetId, "tab:profile-a:101");
     assert.equal(resumed.sessionId, attached.result.sessionId);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "resuming");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "resuming");
     cdp.close();
   } finally {
     extension.close();
@@ -1005,7 +1457,7 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
 
 test("failed reconnect restores the detached control fence", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -1032,7 +1484,7 @@ test("failed reconnect restores the detached control fence", async () => {
       }),
     );
     await waitFor(
-      async () => (await fetchJson(port, "/health")).sessions[0].control.phase === "detached",
+      async () => (await fetchJson(port, "/control/status")).sessions[0].control.phase === "detached",
     );
 
     extension.failMethods.add("Bridge.setControlOverlay");
@@ -1040,12 +1492,12 @@ test("failed reconnect restores the detached control fence", async () => {
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ targetId: "tab:profile-a:101" }),
       },
     );
     assert.equal(failed.status, 409);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "detached");
 
     extension.failMethods.delete("Bridge.setControlOverlay");
     const recovered = await postJson(
@@ -1064,7 +1516,7 @@ test("failed reconnect restores the detached control fence", async () => {
 
 test("reconnect accepts an explicit target from another connected Chrome profile", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const first = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://a.example", title: "A", active: true },
@@ -1128,7 +1580,7 @@ test("reconnect accepts an explicit target from another connected Chrome profile
 
 test("lists redacted reconnect targets without leaking page content or other ownership", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     {
@@ -1206,7 +1658,7 @@ test("lists redacted reconnect targets without leaking page content or other own
 
 test("a full tab snapshot turns a silently closed browser into a recoverable detach", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -1236,7 +1688,7 @@ test("a full tab snapshot turns a silently closed browser into a recoverable det
     const events = await fetchJson(port, "/control/events?after=0");
     assert.equal(events.events[0].action, "detach");
     assert.equal(events.events[0].reason, "browser_closed");
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "detached");
 
     extension.send(
       JSON.stringify({
@@ -1273,7 +1725,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
   const root = mkdtempSync(join(tmpdir(), "agent-browser-bridge-state-"));
   const statePath = join(root, "sessions.json");
   const firstPort = await freePort();
-  const firstDaemon = new BridgeDaemon({
+  const firstDaemon = createDaemon({
     port: firstPort,
     commandTimeoutMs: 5000,
     statePath,
@@ -1299,7 +1751,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
     cdp.close();
 
     const secondPort = await freePort();
-    const secondDaemon = new BridgeDaemon({
+    const secondDaemon = createDaemon({
       port: secondPort,
       commandTimeoutMs: 5000,
       statePath,
@@ -1309,7 +1761,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
       { tabId: 101, windowId: 1, url: "https://example.com/restarted", title: "Example", active: true },
     ]);
     try {
-      const health = await fetchJson(secondPort, "/health");
+      const health = await fetchJson(secondPort, "/control/status");
       assert.equal(health.sessions[0].sessionId, session.sessionId);
       assert.equal(health.sessions[0].control.phase, "detached");
       const recoveredEvents = await fetchJson(secondPort, "/control/events?after=0");
@@ -1363,7 +1815,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
 
 test("session creation rejects non-loopback return origins", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   try {
     for (const returnOrigin of [
@@ -1373,7 +1825,7 @@ test("session creation rejects non-loopback return origins", async () => {
     ]) {
       const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ returnOrigin }),
       });
       assert.equal(response.status, 400);
@@ -1390,13 +1842,16 @@ test("session creation rejects non-loopback return origins", async () => {
 
 test("human control never focuses an arbitrary unscoped browser tab", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://unrelated.example", title: "Unrelated", active: true },
   ]);
   try {
-    await postJson(port, "/sessions", { ownerSessionId: "nex-aaaaaaaaaaaaaaaa" });
+    await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      targetIds: [],
+    });
     const takeover = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
       phase: "human",
     });
@@ -1413,7 +1868,7 @@ test("human control never focuses an arbitrary unscoped browser tab", async () =
 
 test("control HTTP reports provider focus rejection instead of hanging the request", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -1433,7 +1888,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ phase: "human" }),
         signal: AbortSignal.timeout(1_000),
       },
@@ -1456,7 +1911,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
       const events = await fetchJson(port, "/control/events?after=0");
       return events.events.length === 1;
     });
-    const afterPageTakeover = await fetchJson(port, "/health");
+    const afterPageTakeover = await fetchJson(port, "/control/status");
     assert.equal(afterPageTakeover.daemon, "ok");
     assert.equal(afterPageTakeover.sessions[0].control.phase, "human");
     assert.ok(
@@ -1475,7 +1930,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
 
 test("daemon routes CDP events only to the owning bridge session", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://a.example", title: "A", active: true },
@@ -1553,7 +2008,7 @@ test("daemon routes CDP events only to the owning bridge session", async () => {
 
 test("an owned opener adopts its child tab and exposes it only to that bridge session", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     {
@@ -1741,7 +2196,7 @@ test("an owned opener adopts its child tab and exposes it only to that bridge se
 
 test("human-created child ownership is replayed to the agent after its URL becomes automatable", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     {
@@ -2013,17 +2468,26 @@ async function cdpCommand(ws, command) {
 }
 
 async function postJson(port, path, body) {
+  const hostSessionRequest = path === "/sessions" && typeof body?.nonce !== "string";
+  const sessionDetachRequest = /^\/sessions\/[^/]+\/detach$/.test(path);
+  const requestBody = hostSessionRequest
+    ? { ownerSessionId: "nex-aaaaaaaaaaaaaaaa", ...body }
+    : body;
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
-    body: JSON.stringify(body),
-    headers: { "content-type": "application/json" },
+    body: JSON.stringify(requestBody),
+    headers: path.startsWith("/control") || hostSessionRequest || sessionDetachRequest
+      ? controlHeaders({ "content-type": "application/json" })
+      : { "content-type": "application/json" },
   });
   assert.equal(response.ok, true);
   return await response.json();
 }
 
 async function fetchJson(port, path) {
-  const response = await fetch(`http://127.0.0.1:${port}${path}`);
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+    headers: path.startsWith("/control") ? controlHeaders() : undefined,
+  });
   assert.equal(response.ok, true);
   return await response.json();
 }

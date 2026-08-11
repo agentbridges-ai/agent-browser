@@ -4528,7 +4528,12 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     let save_result = auto_save_restore_state(state).await;
-    close_all_browser_backends(state).await?;
+    // Closing is a lifecycle guarantee for the native session. A provider may
+    // already be fenced or detached and reject its final CDP cleanup command,
+    // but close_all_browser_backends has still dropped every local backend and
+    // attempted provider cleanup. Report that bounded cleanup error without
+    // keeping the native daemon and socket alive indefinitely.
+    let close_error = close_all_browser_backends(state).await.err();
 
     // Stop background Fetch handler
     if let Some(task) = state.fetch_handler_task.take() {
@@ -4544,25 +4549,29 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     }
 
     state.ref_map.clear();
-    match save_result {
-        Ok(Some(path)) => Ok(json!({
+    let mut result = match save_result {
+        Ok(Some(path)) => json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status,
             "statePath": path
-        })),
-        Ok(None) => Ok(json!({
+        }),
+        Ok(None) => json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status
-        })),
-        Err(err) => Ok(json!({
+        }),
+        Err(err) => json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status,
             "saveError": err
-        })),
+        }),
+    };
+    if let Some(error) = close_error {
+        result["closeError"] = json!(error);
     }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

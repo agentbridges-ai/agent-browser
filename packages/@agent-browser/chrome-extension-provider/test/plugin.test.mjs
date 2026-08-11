@@ -1,10 +1,29 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { PINNED_CHROME_EXTENSION_ID } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 import { handlePluginRequest } from "../dist/plugin.js";
+
+const TEST_CONTROL_TOKEN = "a".repeat(64);
+const TEST_SESSION_GRANT_SECRET = "b".repeat(64);
+
+function sessionGrant() {
+  const encoded = Buffer.from(
+    JSON.stringify({
+      v: 1,
+      grantId: randomUUID(),
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      profileUrlHint: "/session/674fb240-55e4-427e-a544-60c5b22226f0",
+      returnOrigin: "http://127.0.0.1:3458",
+    }),
+  ).toString("base64url");
+  return `${encoded}.${createHmac("sha256", TEST_SESSION_GRANT_SECRET).update(encoded).digest("base64url")}`;
+}
 
 test("plugin manifest declares provider and management capabilities", async () => {
   const response = await handlePluginRequest({
@@ -20,6 +39,19 @@ test("plugin manifest declares provider and management capabilities", async () =
     "command.run",
     "chrome-extension.manage",
   ]);
+});
+
+test("plugin executable emits JSON when its filesystem path contains spaces", () => {
+  const output = execFileSync(process.execPath, [fileURLToPath(new URL("../dist/plugin.js", import.meta.url))], {
+    encoding: "utf8",
+    input: JSON.stringify({
+      protocol: "agent-browser.plugin.v1",
+      type: "plugin.manifest",
+      capability: "plugin.manifest",
+      request: {},
+    }),
+  });
+  assert.equal(JSON.parse(output).success, true);
 });
 
 test("plugin status reports offline daemon without failing", async () => {
@@ -45,14 +77,18 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
   const oldPort = process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT;
   const oldProfileUrlHint = process.env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT;
   const oldOwnerSessionId = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID;
+  const oldSessionGrant = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT;
   process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT = String(port);
   process.env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT =
     "/session/674fb240-55e4-427e-a544-60c5b22226f0";
   process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID = "nex-aaaaaaaaaaaaaaaa";
+  process.env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT = sessionGrant();
   const daemon = new BridgeDaemon({
     port,
     commandTimeoutMs: 5000,
     allowedExtensionId: PINNED_CHROME_EXTENSION_ID,
+    controlToken: TEST_CONTROL_TOKEN,
+    sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
   });
   await daemon.start();
   const extension = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
@@ -83,9 +119,7 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
     );
     assert.equal(response.browser.directPage, false);
     assert.equal(response.browser.cleanup.port, port);
-    const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
-    assert.equal(health.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
-    assert.equal("profileUrlHint" in health.sessions[0], false);
+    assert.equal(daemon.status().sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
 
     const close = await handlePluginRequest({
       protocol: "agent-browser.plugin.v1",
@@ -100,6 +134,7 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
     restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PORT", oldPort);
     restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT", oldProfileUrlHint);
     restoreEnv("NEXOLYRA_AGENT_BROWSER_SESSION_ID", oldOwnerSessionId);
+    restoreEnv("NEXOLYRA_AGENT_BROWSER_SESSION_GRANT", oldSessionGrant);
   }
 });
 
@@ -107,7 +142,12 @@ test("plugin refuses to reuse a daemon without the pinned extension boundary", a
   const port = await freePort();
   const oldPort = process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT;
   process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT = String(port);
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = new BridgeDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    controlToken: TEST_CONTROL_TOKEN,
+    sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+  });
   await daemon.start();
 
   try {
