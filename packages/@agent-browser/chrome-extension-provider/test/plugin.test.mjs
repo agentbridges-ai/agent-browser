@@ -13,13 +13,16 @@ const TEST_CONTROL_TOKEN = "a".repeat(64);
 const TEST_SESSION_GRANT_SECRET = "b".repeat(64);
 
 function sessionGrant() {
+  const iat = Math.floor(Date.now() / 1000);
   const encoded = Buffer.from(
     JSON.stringify({
-      v: 1,
+      v: 2,
       grantId: randomUUID(),
       ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
       profileUrlHint: "/session/674fb240-55e4-427e-a544-60c5b22226f0",
       returnOrigin: "http://127.0.0.1:3458",
+      iat,
+      exp: iat + 120,
     }),
   ).toString("base64url");
   return `${encoded}.${createHmac("sha256", TEST_SESSION_GRANT_SECRET).update(encoded).digest("base64url")}`;

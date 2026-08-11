@@ -107,9 +107,11 @@ type OwnerScope = {
 };
 
 type SessionGrant = OwnerScope & {
-  v: 1;
+  v: 2;
   grantId: string;
   ownerSessionId: string;
+  iat: number;
+  exp: number;
 };
 
 type SessionNonce = OwnerScope & {
@@ -128,12 +130,16 @@ type PersistedBridgeSession = {
 };
 
 type PersistedBridgeState = {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   sessions: PersistedBridgeSession[];
   owners?: Array<{
     ownerSessionId: string;
     control: ControlState;
     scope?: OwnerScope;
+  }>;
+  usedSessionGrants?: Array<{
+    grantId: string;
+    expiresAt: number;
   }>;
 };
 
@@ -172,6 +178,8 @@ const LIVE_SCREENCAST_PARAMS = {
 
 const DEFAULT_SESSION_RETENTION_MS = 30 * 60 * 1_000;
 const SESSION_NONCE_TTL_MS = 60_000;
+const SESSION_GRANT_MAX_TTL_SECONDS = 300;
+const SESSION_GRANT_CLOCK_SKEW_SECONDS = 30;
 const OWNER_SESSION_ID_PATTERN = /^nex-[a-f0-9]{16}$/;
 
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
@@ -191,7 +199,9 @@ export class BridgeDaemon {
   private readonly ownerControls = new Map<string, ControlState>();
   private readonly ownerScopes = new Map<string, OwnerScope>();
   private readonly sessionNonces = new Map<string, SessionNonce>();
-  private readonly usedSessionGrants = new Set<string>();
+  // Persist consumed grant IDs through their bounded lifetime so a daemon
+  // restart cannot turn a one-time creation capability into a replayable one.
+  private readonly usedSessionGrants = new Map<string, number>();
   private readonly controlEvents: QueuedControlEvent[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly cdpClients = new Map<WebSocket, string>();
@@ -225,7 +235,7 @@ export class BridgeDaemon {
       void this.handleHttp(req, res).catch((error) => {
         this.logger.error("bridge HTTP request failed", {
           method: req.method ?? null,
-          path: req.url ?? null,
+          path: safeRequestPath(req.url),
           error: error instanceof Error ? error.message : String(error),
         });
         if (res.headersSent) {
@@ -240,7 +250,7 @@ export class BridgeDaemon {
         this.handleUpgrade(req, socket, head);
       } catch (error) {
         this.logger.error("bridge WebSocket upgrade failed", {
-          path: req.url ?? null,
+          path: safeRequestPath(req.url),
           error: error instanceof Error ? error.message : String(error),
         });
         socket.destroy();
@@ -406,22 +416,35 @@ export class BridgeDaemon {
           : undefined;
       const profileUrlHint = validProfileUrlHint(parsed.profileUrlHint);
       const returnOrigin = validReturnOrigin(parsed.returnOrigin);
+      const iat = parsed.iat;
+      const exp = parsed.exp;
+      const now = Math.floor(Date.now() / 1000);
       if (
-        parsed.v !== 1 ||
+        parsed.v !== 2 ||
         typeof parsed.grantId !== "string" ||
         parsed.grantId.length < 8 ||
         parsed.grantId.length > 128 ||
         !ownerSessionId ||
         !profileUrlHint ||
-        (parsed.returnOrigin !== undefined && !returnOrigin)
+        (parsed.returnOrigin !== undefined && !returnOrigin) ||
+        typeof iat !== "number" ||
+        typeof exp !== "number" ||
+        !Number.isSafeInteger(iat) ||
+        !Number.isSafeInteger(exp) ||
+        exp <= iat ||
+        exp - iat > SESSION_GRANT_MAX_TTL_SECONDS ||
+        iat > now + SESSION_GRANT_CLOCK_SKEW_SECONDS ||
+        exp <= now
       ) {
         return null;
       }
       return {
-        v: 1,
+        v: 2,
         grantId: parsed.grantId,
         ownerSessionId,
         profileUrlHint,
+        iat,
+        exp,
         ...(returnOrigin ? { returnOrigin } : {}),
       };
     } catch {
@@ -430,6 +453,7 @@ export class BridgeDaemon {
   }
 
   private issueSessionNonce(grant: SessionGrant): string {
+    this.pruneUsedSessionGrants();
     if (this.usedSessionGrants.has(grant.grantId)) {
       throw new Error("Owner-scoped session grant has already been used");
     }
@@ -456,7 +480,7 @@ export class BridgeDaemon {
         updatedAt: new Date().toISOString(),
       });
     }
-    this.usedSessionGrants.add(grant.grantId);
+    this.usedSessionGrants.set(grant.grantId, grant.exp);
     const nonce = randomBytes(24).toString("base64url");
     this.sessionNonces.set(nonce, {
       ownerSessionId: grant.ownerSessionId,
@@ -464,7 +488,14 @@ export class BridgeDaemon {
       ...(grant.returnOrigin ? { returnOrigin: grant.returnOrigin } : {}),
       expiresAt: Date.now() + SESSION_NONCE_TTL_MS,
     });
+    this.persistSessions();
     return nonce;
+  }
+
+  private pruneUsedSessionGrants(now = Math.floor(Date.now() / 1000)): void {
+    for (const [grantId, expiresAt] of this.usedSessionGrants) {
+      if (expiresAt <= now) this.usedSessionGrants.delete(grantId);
+    }
   }
 
   private consumeSessionNonce(value: unknown): SessionNonce | null {
@@ -629,12 +660,12 @@ export class BridgeDaemon {
       return;
     }
     if (
-      (persisted.schemaVersion !== 1 && persisted.schemaVersion !== 2) ||
+      ![1, 2, 3].includes(persisted.schemaVersion) ||
       !Array.isArray(persisted.sessions)
     )
       return;
     const now = Date.now();
-    if (persisted.schemaVersion === 2 && Array.isArray(persisted.owners)) {
+    if (persisted.schemaVersion >= 2 && Array.isArray(persisted.owners)) {
       for (const owner of persisted.owners) {
         const ownerSessionId =
           typeof owner?.ownerSessionId === "string"
@@ -660,6 +691,19 @@ export class BridgeDaemon {
               ...(returnOrigin ? { returnOrigin } : {}),
             });
           }
+        }
+      }
+    }
+    if (persisted.schemaVersion === 3 && Array.isArray(persisted.usedSessionGrants)) {
+      for (const entry of persisted.usedSessionGrants) {
+        if (
+          typeof entry?.grantId === "string" &&
+          entry.grantId.length >= 8 &&
+          entry.grantId.length <= 128 &&
+          Number.isSafeInteger(entry.expiresAt) &&
+          entry.expiresAt > Math.floor(now / 1000)
+        ) {
+          this.usedSessionGrants.set(entry.grantId, entry.expiresAt);
         }
       }
     }
@@ -749,6 +793,7 @@ export class BridgeDaemon {
   private persistSessions(): void {
     const statePath = this.options.statePath;
     if (!statePath) return;
+    this.pruneUsedSessionGrants();
     const sessions: PersistedBridgeSession[] = [];
     for (const session of this.bridgeSessions.values()) {
       if (!session.ownerSessionId || !OWNER_SESSION_ID_PATTERN.test(session.ownerSessionId))
@@ -776,17 +821,25 @@ export class BridgeDaemon {
         ? { scope: { ...this.ownerScopes.get(ownerSessionId)! } }
         : {}),
     }));
-    if (sessions.length === 0 && owners.length === 0) {
+    const usedSessionGrants = [...this.usedSessionGrants].map(([grantId, expiresAt]) => ({
+      grantId,
+      expiresAt,
+    }));
+    if (sessions.length === 0 && owners.length === 0 && usedSessionGrants.length === 0) {
       rmSync(statePath, { force: true });
       return;
     }
     mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
     const staged = `${statePath}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(staged, `${JSON.stringify({ schemaVersion: 2, sessions, owners })}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
+      writeFileSync(
+        staged,
+        `${JSON.stringify({ schemaVersion: 3, sessions, owners, usedSessionGrants })}\n`,
+        {
+          encoding: "utf8",
+          mode: 0o600,
+        },
+      );
       renameSync(staged, statePath);
     } finally {
       rmSync(staged, { force: true });
@@ -2519,6 +2572,15 @@ export class BridgeDaemon {
 
 function tabsToMap(tabs: BridgeTab[]): Map<number, BridgeTab> {
   return new Map(tabs.map((tab) => [tab.tabId, tab]));
+}
+
+/** Keep request diagnostics useful without persisting query credentials. */
+function safeRequestPath(value: string | undefined): string {
+  try {
+    return new URL(value ?? "/", "http://127.0.0.1").pathname;
+  } catch {
+    return "/";
+  }
 }
 
 function validProfileUrlHint(value: unknown): string | undefined {

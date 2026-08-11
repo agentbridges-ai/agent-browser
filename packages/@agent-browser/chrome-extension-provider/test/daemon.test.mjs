@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
-import { createServer } from "node:net";
-import { existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { connect, createServer } from "node:net";
+import {
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -58,14 +67,19 @@ function sessionGrant({
   ownerSessionId = "nex-aaaaaaaaaaaaaaaa",
   profileUrlHint = "/session/test-session",
   returnOrigin = "http://127.0.0.1:3458",
+  grantId = randomUUID(),
+  iat = Math.floor(Date.now() / 1000),
+  exp = iat + 120,
 } = {}) {
   const encoded = Buffer.from(
     JSON.stringify({
-      v: 1,
-      grantId: randomUUID(),
+      v: 2,
+      grantId,
       ownerSessionId,
       ...(profileUrlHint ? { profileUrlHint } : {}),
       returnOrigin,
+      iat,
+      exp,
     }),
   ).toString("base64url");
   const signature = createHmac("sha256", TEST_SESSION_GRANT_SECRET)
@@ -500,6 +514,44 @@ test("malformed HTTP route encoding cannot terminate the bridge daemon", async (
   }
 });
 
+test("request failure logs never persist CDP query credentials", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-log-redaction-"));
+  const logPath = join(root, "bridge.log");
+  const port = await freePort();
+  const daemon = createDaemon({ port, logPath, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    const token = "do-not-persist-this-cdp-token";
+    await new Promise((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1");
+      socket.once("error", reject);
+      socket.once("close", resolve);
+      socket.once("connect", () => {
+        socket.end(
+          [
+            `GET /devtools/browser/bridge?session=test&token=${token} HTTP/1.1`,
+            "Host: [",
+            "Connection: Upgrade",
+            "Upgrade: websocket",
+            "Sec-WebSocket-Version: 13",
+            `Sec-WebSocket-Key: ${Buffer.alloc(16).toString("base64")}`,
+            "",
+            "",
+          ].join("\r\n"),
+        );
+      });
+    });
+    await waitFor(() => existsSync(logPath) && readFileSync(logPath, "utf8").length > 0);
+    const log = readFileSync(logPath, "utf8");
+    assert.doesNotMatch(log, new RegExp(token));
+    assert.match(log, /"path":"\/devtools\/browser\/bridge"/);
+  } finally {
+    await daemon.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("daemon rejects browser-origin control requests before they can mutate sessions", async () => {
   const port = await freePort();
   const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
@@ -706,7 +758,7 @@ test("owner-scoped session resume fails closed for ambiguous or mismatched exist
   }
 });
 
-test("a daemon restart preserves an owner fence before accepting a stale signed grant", async () => {
+test("a consumed owner-scoped grant cannot be replayed after daemon restart", async () => {
   const root = mkdtempSync(join(tmpdir(), "agent-browser-owner-fence-"));
   const statePath = join(root, "sessions.json");
   const grant = sessionGrant();
@@ -727,13 +779,50 @@ test("a daemon restart preserves an owner fence before accepting a stale signed 
   const second = createDaemon({ port: secondPort, statePath, commandTimeoutMs: 5000 });
   await second.start();
   try {
-    const lease = await postJson(secondPort, "/session-leases", { grant });
-    const session = await postJson(secondPort, "/sessions", { nonce: lease.nonce });
+    const replay = await fetch(`http://127.0.0.1:${secondPort}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant }),
+    });
+    assert.equal(replay.status, 409);
+    assert.match((await replay.json()).error, /already been used/i);
+
+    const freshLease = await postJson(secondPort, "/session-leases", { grant: sessionGrant() });
+    const session = await postJson(secondPort, "/sessions", { nonce: freshLease.nonce });
     const status = await fetchJson(secondPort, "/control/status");
-    assert.equal(status.sessions.find((candidate) => candidate.sessionId === session.sessionId).control.phase, "human");
+    assert.equal(
+      status.sessions.find((candidate) => candidate.sessionId === session.sessionId).control
+        .phase,
+      "human",
+    );
   } finally {
     await second.stop();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("owner-scoped grants require a bounded current validity window", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const now = Math.floor(Date.now() / 1000);
+
+  try {
+    for (const grant of [
+      sessionGrant({ iat: now - 120, exp: now - 1 }),
+      sessionGrant({ iat: now + 31, exp: now + 120 }),
+      sessionGrant({ iat: now, exp: now + 301 }),
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ grant }),
+      });
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /valid owner-scoped session grant/i);
+    }
+  } finally {
+    await daemon.stop();
   }
 });
 

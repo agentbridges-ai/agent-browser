@@ -21,13 +21,16 @@ const controlToken = "a".repeat(64);
 const sessionGrantSecret = "b".repeat(64);
 
 function sessionGrant(profileUrlHint, returnOrigin) {
+  const iat = Math.floor(Date.now() / 1000);
   const encoded = Buffer.from(
     JSON.stringify({
-      v: 1,
+      v: 2,
       grantId: randomUUID(),
       ownerSessionId,
       profileUrlHint,
       returnOrigin,
+      iat,
+      exp: iat + 120,
     }),
   ).toString("base64url");
   return `${encoded}.${createHmac("sha256", sessionGrantSecret).update(encoded).digest("base64url")}`;
