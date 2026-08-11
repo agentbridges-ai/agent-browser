@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHmac, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -16,6 +17,21 @@ const daemonScript = join(packageDir, "dist", "daemon", "cli.js");
 const agentBrowserCli = join(rootDir, "bin", "agent-browser.js");
 const pinnedExtensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
 const ownerSessionId = "nex-a11ce0b5e55e1001";
+const controlToken = "a".repeat(64);
+const sessionGrantSecret = "b".repeat(64);
+
+function sessionGrant(profileUrlHint, returnOrigin) {
+  const encoded = Buffer.from(
+    JSON.stringify({
+      v: 1,
+      grantId: randomUUID(),
+      ownerSessionId,
+      profileUrlHint,
+      returnOrigin,
+    }),
+  ).toString("base64url");
+  return `${encoded}.${createHmac("sha256", sessionGrantSecret).update(encoded).digest("base64url")}`;
+}
 
 test("Chrome extension bridge drives a real Chrome for Testing profile", async (t) => {
   const requireRealExtension = process.env.AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION === "1";
@@ -43,6 +59,8 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
   const fixture = await startFixtureServer();
   const pageUrls = fixture.urls;
   const session = "ce";
+  const profileUrlHint = "/session/a11ce0b5-e55e-1001-a11c-e0b5e55e1001";
+  const returnOrigin = "http://127.0.0.1:3458";
   const commonEnv = {
     ...process.env,
     AGENT_BROWSER_CHROME_BRIDGE_PORT: String(bridgePort),
@@ -63,6 +81,11 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
     // deterministic cleanup.
     AGENT_BROWSER_IDLE_TIMEOUT_MS: "30000",
     NEXOLYRA_AGENT_BROWSER_SESSION_ID: ownerSessionId,
+    NEXOLYRA_AGENT_BROWSER_CONTROL_TOKEN: controlToken,
+    NEXOLYRA_AGENT_BROWSER_SESSION_GRANT_SECRET: sessionGrantSecret,
+    NEXOLYRA_AGENT_BROWSER_SESSION_GRANT: sessionGrant(profileUrlHint, returnOrigin),
+    AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT: profileUrlHint,
+    AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN: returnOrigin,
   };
 
   const daemon = spawn(process.execPath, [daemonScript], {
@@ -242,10 +265,14 @@ ${mockBridge?.commandLog.join("\n") ?? "(real extension)"}`);
       assert.match(JSON.stringify(forgedOperatorIntent.data), /"shadowRoot":false/);
 
       await delay(250);
-      const health = await fetchJson(`http://127.0.0.1:${bridgePort}/health`);
+      const health = await fetchJson(`http://127.0.0.1:${bridgePort}/control/status`, {
+        headers: { authorization: `Bearer ${controlToken}` },
+      });
       const owner = health.sessions.find((candidate) => candidate.ownerSessionId === ownerSessionId);
       assert.equal(owner?.control?.phase, "agent");
-      const controlEvents = await fetchJson(`http://127.0.0.1:${bridgePort}/control/events`);
+      const controlEvents = await fetchJson(`http://127.0.0.1:${bridgePort}/control/events`, {
+        headers: { authorization: `Bearer ${controlToken}` },
+      });
       assert.equal(controlEvents.events.some((event) => event.ownerSessionId === ownerSessionId), false);
     }
   } finally {
@@ -741,8 +768,8 @@ async function isPortOpen(port) {
   });
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
+async function fetchJson(url, init) {
+  const response = await fetch(url, init);
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return await response.json();
 }

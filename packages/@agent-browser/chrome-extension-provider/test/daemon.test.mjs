@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -9,13 +10,38 @@ import { parseExtensionId, readBridgeConfig } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 
 const TEST_CONTROL_TOKEN = "a".repeat(64);
+const TEST_SESSION_GRANT_SECRET = "b".repeat(64);
 
 function createDaemon(options) {
-  return new BridgeDaemon({ controlToken: TEST_CONTROL_TOKEN, ...options });
+  return new BridgeDaemon({
+    controlToken: TEST_CONTROL_TOKEN,
+    sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+    ...options,
+  });
 }
 
 function controlHeaders(headers = {}) {
   return { authorization: `Bearer ${TEST_CONTROL_TOKEN}`, ...headers };
+}
+
+function sessionGrant({
+  ownerSessionId = "nex-aaaaaaaaaaaaaaaa",
+  profileUrlHint = "/session/test-session",
+  returnOrigin = "http://127.0.0.1:3458",
+} = {}) {
+  const encoded = Buffer.from(
+    JSON.stringify({
+      v: 1,
+      grantId: randomUUID(),
+      ownerSessionId,
+      ...(profileUrlHint ? { profileUrlHint } : {}),
+      returnOrigin,
+    }),
+  ).toString("base64url");
+  const signature = createHmac("sha256", TEST_SESSION_GRANT_SECRET)
+    .update(encoded)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
 }
 
 test("extension allowlist configuration accepts only canonical Chrome ids", () => {
@@ -116,7 +142,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
   ]);
 
   try {
-    const health = await fetchJson(port, "/health");
+    const health = await fetchJson(port, "/control/status");
     assert.equal(health.supervisedByNexolyra, true);
     assert.equal(health.processId, process.pid);
     await assertInvalidToken(port);
@@ -169,7 +195,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
       extension.commands.some(
         (command) =>
           command.method === "Page.captureScreenshot" &&
-          command.tabId === 202 &&
+          command.tabId === 303 &&
           command.params.format === "jpeg" &&
           command.params.quality === 60 &&
           command.params.fromSurface === true,
@@ -220,7 +246,9 @@ test("daemon prevents another bridge session from attaching an already controlle
 
   try {
     const ownerSession = await postJson(port, "/sessions", {});
-    const otherSession = await postJson(port, "/sessions", {});
+    const otherSession = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-bbbbbbbbbbbbbbbb",
+    });
     const ownerCdp = await connectCdp(port, ownerSession.sessionId, ownerSession.token);
     const otherCdp = await connectCdp(port, otherSession.sessionId, otherSession.token);
 
@@ -417,7 +445,7 @@ test("daemon rejects browser-origin control requests before they can mutate sess
       body: "{}",
     });
     assert.equal(response.status, 403);
-    assert.equal((await fetchJson(port, "/health")).sessions.length, 0);
+    assert.equal((await fetchJson(port, "/control/status")).sessions.length, 0);
   } finally {
     await daemon.stop();
   }
@@ -484,6 +512,170 @@ test("daemon rejects a host control phase flip without the Nexolyra control toke
       false,
     );
     cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("daemon rejects anonymous, ownerless, and unscoped session minting", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    const anonymous = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(anonymous.status, 401);
+
+    const ownerless = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: controlHeaders({ "content-type": "application/json" }),
+      body: "{}",
+    });
+    assert.equal(ownerless.status, 400);
+
+    const unscopedLease = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: sessionGrant({ profileUrlHint: null }) }),
+    });
+    assert.equal(unscopedLease.status, 400);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("one-time session nonce inherits human control and cannot be replayed", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    {
+      tabId: 101,
+      windowId: 1,
+      url: "http://127.0.0.1:3458/session/test-session",
+      title: "Nexolyra",
+      active: true,
+    },
+  ]);
+
+  try {
+    const grant = sessionGrant();
+    const lease = await postJson(port, "/session-leases", { grant });
+    const reusedGrant = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant }),
+    });
+    assert.equal(reusedGrant.status, 409);
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "human" });
+    const minted = await postJson(port, "/sessions", { nonce: lease.nonce });
+    const controlStatus = await fetchJson(port, "/control/status");
+    assert.equal(controlStatus.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
+    assert.equal(controlStatus.sessions[0].control.phase, "human");
+
+    const replay = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce: lease.nonce }),
+    });
+    assert.equal(replay.status, 401);
+
+    const cdp = await connectCdp(port, minted.sessionId, minted.token);
+    const mutation = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.createTarget",
+      params: { url: "https://example.com" },
+    });
+    assert.match(mutation.error?.message || "", /held by the user|human/i);
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("a daemon restart preserves an owner fence before accepting a stale signed grant", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-owner-fence-"));
+  const statePath = join(root, "sessions.json");
+  const grant = sessionGrant();
+  const firstPort = await freePort();
+  const first = createDaemon({ port: firstPort, statePath, commandTimeoutMs: 5000 });
+  await first.start();
+  try {
+    const lease = await postJson(firstPort, "/session-leases", { grant });
+    assert.equal(typeof lease.nonce, "string");
+    await postJson(firstPort, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "human" });
+    await first.shutdown();
+  } catch (error) {
+    await first.stop().catch(() => undefined);
+    throw error;
+  }
+
+  const secondPort = await freePort();
+  const second = createDaemon({ port: secondPort, statePath, commandTimeoutMs: 5000 });
+  await second.start();
+  try {
+    const lease = await postJson(secondPort, "/session-leases", { grant });
+    const session = await postJson(secondPort, "/sessions", { nonce: lease.nonce });
+    const status = await fetchJson(secondPort, "/control/status");
+    assert.equal(status.sessions.find((candidate) => candidate.sessionId === session.sessionId).control.phase, "human");
+  } finally {
+    await second.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session detach requires either host control or the matching bridge token", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      targetIds: [],
+    });
+    const anonymous = await fetch(
+      `http://127.0.0.1:${port}/sessions/${encodeURIComponent(session.sessionId)}/detach`,
+      { method: "POST" },
+    );
+    assert.equal(anonymous.status, 401);
+    const self = await fetch(
+      `http://127.0.0.1:${port}/sessions/${encodeURIComponent(session.sessionId)}/detach`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${session.token}` },
+      },
+    );
+    assert.equal(self.status, 200);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("public health redacts session ownership and tab details", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://private.example", title: "Private", active: true },
+  ]);
+
+  try {
+    await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      targetIds: ["tab:profile-a:101"],
+    });
+    const health = await fetchJson(port, "/health");
+    assert.equal("sessions" in health, false);
+    assert.equal("tabs" in health.profiles[0], false);
+    const controlStatus = await fetchJson(port, "/control/status");
+    assert.equal(controlStatus.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
   } finally {
     extension.close();
     await daemon.stop();
@@ -597,7 +789,7 @@ test("daemon selects the owning profile and isolates a host session in its own t
       targets.result.targetInfos.map((target) => target.url),
       ["https://example.com/task"],
     );
-    const health = await fetchJson(port, "/health");
+    const health = await fetchJson(port, "/control/status");
     assert.equal(health.sessions[0].profileId, "profile-b");
     assert.equal("profileUrlHint" in health.sessions[0], false);
 
@@ -847,14 +1039,14 @@ test("external tab detachment is recoverable and does not become user Stop", asy
       pendingActionRisk: false,
       createdAt: events.events[0].createdAt,
     });
-    const health = await fetchJson(port, "/health");
+    const health = await fetchJson(port, "/control/status");
     assert.equal(health.sessions[0].control.phase, "detached");
 
     const reenabled = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
       phase: "agent",
     });
     assert.equal(reenabled.matched, 1);
-    const afterReenable = await fetchJson(port, "/health");
+    const afterReenable = await fetchJson(port, "/control/status");
     assert.equal(afterReenable.sessions[0].control.phase, "agent");
     cdp.close();
   } finally {
@@ -936,7 +1128,7 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
           command.params.returnOrigin === undefined,
       ),
     );
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "resuming");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "resuming");
 
     const targets = await cdpCommand(cdp, { id: 2, method: "Target.getTargets", params: {} });
     assert.deepEqual(
@@ -1012,7 +1204,7 @@ test("reconnect never auto-selects a unique or active target without an explicit
       }),
     );
     await waitFor(
-      async () => (await fetchJson(port, "/health")).sessions[0].control.phase === "detached",
+      async () => (await fetchJson(port, "/control/status")).sessions[0].control.phase === "detached",
     );
 
     const response = await fetch(
@@ -1026,7 +1218,7 @@ test("reconnect never auto-selects a unique or active target without an explicit
     assert.equal(response.status, 409);
     const payload = await response.json();
     assert.match(payload.error, /explicit targetId/);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "detached");
     cdp.close();
   } finally {
     extension.close();
@@ -1065,7 +1257,7 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
     );
     assert.equal(mismatched.status, 409);
     assert.match((await mismatched.json()).error, /already attached to a different/);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "human");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "human");
 
     const resumed = await postJson(
       port,
@@ -1074,7 +1266,7 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
     );
     assert.equal(resumed.targetId, "tab:profile-a:101");
     assert.equal(resumed.sessionId, attached.result.sessionId);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "resuming");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "resuming");
     cdp.close();
   } finally {
     extension.close();
@@ -1111,7 +1303,7 @@ test("failed reconnect restores the detached control fence", async () => {
       }),
     );
     await waitFor(
-      async () => (await fetchJson(port, "/health")).sessions[0].control.phase === "detached",
+      async () => (await fetchJson(port, "/control/status")).sessions[0].control.phase === "detached",
     );
 
     extension.failMethods.add("Bridge.setControlOverlay");
@@ -1124,7 +1316,7 @@ test("failed reconnect restores the detached control fence", async () => {
       },
     );
     assert.equal(failed.status, 409);
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "detached");
 
     extension.failMethods.delete("Bridge.setControlOverlay");
     const recovered = await postJson(
@@ -1315,7 +1507,7 @@ test("a full tab snapshot turns a silently closed browser into a recoverable det
     const events = await fetchJson(port, "/control/events?after=0");
     assert.equal(events.events[0].action, "detach");
     assert.equal(events.events[0].reason, "browser_closed");
-    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+    assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "detached");
 
     extension.send(
       JSON.stringify({
@@ -1388,7 +1580,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
       { tabId: 101, windowId: 1, url: "https://example.com/restarted", title: "Example", active: true },
     ]);
     try {
-      const health = await fetchJson(secondPort, "/health");
+      const health = await fetchJson(secondPort, "/control/status");
       assert.equal(health.sessions[0].sessionId, session.sessionId);
       assert.equal(health.sessions[0].control.phase, "detached");
       const recoveredEvents = await fetchJson(secondPort, "/control/events?after=0");
@@ -1475,7 +1667,10 @@ test("human control never focuses an arbitrary unscoped browser tab", async () =
     { tabId: 101, windowId: 1, url: "https://unrelated.example", title: "Unrelated", active: true },
   ]);
   try {
-    await postJson(port, "/sessions", { ownerSessionId: "nex-aaaaaaaaaaaaaaaa" });
+    await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      targetIds: [],
+    });
     const takeover = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
       phase: "human",
     });
@@ -1535,7 +1730,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
       const events = await fetchJson(port, "/control/events?after=0");
       return events.events.length === 1;
     });
-    const afterPageTakeover = await fetchJson(port, "/health");
+    const afterPageTakeover = await fetchJson(port, "/control/status");
     assert.equal(afterPageTakeover.daemon, "ok");
     assert.equal(afterPageTakeover.sessions[0].control.phase, "human");
     assert.ok(
@@ -2092,10 +2287,15 @@ async function cdpCommand(ws, command) {
 }
 
 async function postJson(port, path, body) {
+  const hostSessionRequest = path === "/sessions" && typeof body?.nonce !== "string";
+  const sessionDetachRequest = /^\/sessions\/[^/]+\/detach$/.test(path);
+  const requestBody = hostSessionRequest
+    ? { ownerSessionId: "nex-aaaaaaaaaaaaaaaa", ...body }
+    : body;
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
-    body: JSON.stringify(body),
-    headers: path.startsWith("/control")
+    body: JSON.stringify(requestBody),
+    headers: path.startsWith("/control") || hostSessionRequest || sessionDetachRequest
       ? controlHeaders({ "content-type": "application/json" })
       : { "content-type": "application/json" },
   });

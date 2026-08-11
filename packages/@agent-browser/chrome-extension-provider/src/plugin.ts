@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { defaultDaemonScriptPath, readBridgeConfig } from "./config.js";
 import {
   BRIDGE_PROTOCOL_VERSION,
@@ -68,8 +68,7 @@ async function launchBrowserProvider(): Promise<PluginResponse> {
   const session = await createSession(
     config.port,
     config.profileId,
-    config.profileUrlHint,
-    config.returnOrigin,
+    config.sessionGrant,
   );
   return {
     protocol: PLUGIN_PROTOCOL,
@@ -80,6 +79,7 @@ async function launchBrowserProvider(): Promise<PluginResponse> {
       cleanup: {
         port: config.port,
         sessionId: session.sessionId,
+        token: session.token,
       },
       metadata: {
         bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
@@ -93,9 +93,11 @@ async function launchBrowserProvider(): Promise<PluginResponse> {
 async function closeBrowserProvider(request: Record<string, unknown>): Promise<PluginResponse> {
   const port = typeof request.port === "number" ? request.port : readBridgeConfig().port;
   const sessionId = typeof request.sessionId === "string" ? request.sessionId : undefined;
-  if (sessionId) {
+  const token = typeof request.token === "string" ? request.token : undefined;
+  if (sessionId && token) {
     await fetchJson(`http://127.0.0.1:${port}/sessions/${encodeURIComponent(sessionId)}/detach`, {
       method: "POST",
+      headers: { authorization: `Bearer ${token}` },
     }).catch(() => undefined);
   }
   return {
@@ -174,13 +176,22 @@ async function waitForProfiles(port: number, timeoutMs: number): Promise<boolean
 async function createSession(
   port: number,
   profileId: string | undefined,
-  profileUrlHint: string | undefined,
-  returnOrigin: string | undefined,
+  sessionGrant: string | undefined,
 ): Promise<BridgeSession> {
-  const ownerSessionId = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID;
+  if (!sessionGrant) {
+    throw new Error("Nexolyra did not provide an owner-scoped browser session grant");
+  }
+  const lease = await fetchJson(`http://127.0.0.1:${port}/session-leases`, {
+    method: "POST",
+    body: JSON.stringify({ grant: sessionGrant }),
+    headers: { "content-type": "application/json" },
+  });
+  if (typeof lease.nonce !== "string") {
+    throw new Error("Chrome bridge did not return a session nonce");
+  }
   return (await fetchJson(`http://127.0.0.1:${port}/sessions`, {
     method: "POST",
-    body: JSON.stringify({ profileId, profileUrlHint, returnOrigin, ownerSessionId }),
+    body: JSON.stringify({ nonce: lease.nonce, ...(profileId ? { profileId } : {}) }),
     headers: { "content-type": "application/json" },
   })) as BridgeSession;
 }
@@ -244,7 +255,7 @@ function extensionPath(): string {
   return fileURLToPath(new URL("../entrypoints", import.meta.url));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     process.stdout.write(
       JSON.stringify(failure(error instanceof Error ? error.message : String(error))),
