@@ -8,6 +8,16 @@ import WebSocket from "ws";
 import { parseExtensionId, readBridgeConfig } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 
+const TEST_CONTROL_TOKEN = "a".repeat(64);
+
+function createDaemon(options) {
+  return new BridgeDaemon({ controlToken: TEST_CONTROL_TOKEN, ...options });
+}
+
+function controlHeaders(headers = {}) {
+  return { authorization: `Bearer ${TEST_CONTROL_TOKEN}`, ...headers };
+}
+
 test("extension allowlist configuration accepts only canonical Chrome ids", () => {
   assert.equal(parseExtensionId(undefined), undefined);
   assert.equal(
@@ -76,7 +86,7 @@ test("daemon atomically migrates a valid legacy state file to the fixed state pa
     })}\n`,
     { encoding: "utf8" },
   );
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port: await freePort(),
     statePath,
     legacyStatePaths: [legacyStatePath],
@@ -95,7 +105,7 @@ test("daemon atomically migrates a valid legacy state file to the fixed state pa
 
 test("daemon validates CDP tokens and routes core CDP traffic through the extension bridge", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     supervisedByNexolyra: true,
@@ -202,7 +212,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
 
 test("daemon prevents another bridge session from attaching an already controlled tab", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -299,7 +309,7 @@ test("daemon prevents another bridge session from attaching an already controlle
 test("daemon accepts only the pinned Chrome extension origin and identity", async () => {
   const extensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
   const port = await freePort();
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     allowedExtensionId: extensionId,
@@ -365,7 +375,7 @@ test("daemon accepts only the pinned Chrome extension origin and identity", asyn
 
 test("malformed HTTP route encoding cannot terminate the bridge daemon", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
 
   try {
@@ -377,7 +387,9 @@ test("malformed HTTP route encoding cannot terminate the bridge daemon", async (
     ]) {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {
         method: path.endsWith("/targets") ? "GET" : "POST",
-        headers: { "content-type": "application/json" },
+        headers: path.startsWith("/control")
+          ? controlHeaders({ "content-type": "application/json" })
+          : { "content-type": "application/json" },
         body: path.endsWith("/targets") ? undefined : "{}",
       });
       assert.equal(response.status, 400);
@@ -392,7 +404,7 @@ test("malformed HTTP route encoding cannot terminate the bridge daemon", async (
 
 test("daemon rejects browser-origin control requests before they can mutate sessions", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
 
   try {
@@ -411,9 +423,76 @@ test("daemon rejects browser-origin control requests before they can mutate sess
   }
 });
 
+test("daemon rejects a host control phase flip without the Nexolyra control token", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    controlToken: TEST_CONTROL_TOKEN,
+  });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    const takeover = await fetch(
+      `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TEST_CONTROL_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ phase: "human" }),
+      },
+    );
+    assert.equal(takeover.status, 200);
+
+    const unauthorizedFlip = await fetch(
+      `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ phase: "agent" }),
+      },
+    );
+    assert.equal(unauthorizedFlip.status, 401);
+
+    const mutation = await cdpCommand(cdp, {
+      id: 2,
+      sessionId: attached.result.sessionId,
+      method: "Runtime.evaluate",
+      params: { expression: "document.body.dataset.compromised = 'true'" },
+    });
+    assert.match(mutation.error?.message || "", /held by the user|human/i);
+    assert.equal(
+      extension.commands.some(
+        (command) =>
+          command.method === "Runtime.evaluate" &&
+          command.params.expression?.includes("compromised"),
+      ),
+      false,
+    );
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
 test("daemon requires an explicit profile when multiple extension profiles are connected", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const first = await connectExtension(port, "profile-a", [
     { tabId: 1, url: "https://a.example", title: "A", active: true },
@@ -441,7 +520,7 @@ test("daemon requires an explicit profile when multiple extension profiles are c
 
 test("daemon selects the owning profile and isolates a host session in its own task window", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({
+  const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     detachedTargetGraceMs: 50,
@@ -598,7 +677,7 @@ test("daemon selects the owning profile and isolates a host session in its own t
 
 test("daemon preserves the multiple-profile error when a route hint is ambiguous", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const first = await connectExtension(port, "profile-a", [
     { tabId: 1, url: "https://a.example/session/shared", title: "A", active: true },
@@ -626,7 +705,7 @@ test("daemon preserves the multiple-profile error when a route hint is ambiguous
 
 test("page takeover fences queued and future CDP commands and emits a bounded owner event", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -724,7 +803,7 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
 
 test("external tab detachment is recoverable and does not become user Stop", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -786,7 +865,7 @@ test("external tab detachment is recoverable and does not become user Stop", asy
 
 test("reconnect enters readback-only control and preserves the CDP attachment id", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -906,7 +985,7 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
 
 test("reconnect never auto-selects a unique or active target without an explicit id", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -940,7 +1019,7 @@ test("reconnect never auto-selects a unique or active target without an explicit
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: "{}",
       },
     );
@@ -957,7 +1036,7 @@ test("reconnect never auto-selects a unique or active target without an explicit
 
 test("reconnect cannot silently replace an existing task tab with a requested target", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://one.example", title: "One", active: true },
@@ -980,7 +1059,7 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ targetId: "tab:profile-a:202" }),
       },
     );
@@ -1005,7 +1084,7 @@ test("reconnect cannot silently replace an existing task tab with a requested ta
 
 test("failed reconnect restores the detached control fence", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -1040,7 +1119,7 @@ test("failed reconnect restores the detached control fence", async () => {
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ targetId: "tab:profile-a:101" }),
       },
     );
@@ -1064,7 +1143,7 @@ test("failed reconnect restores the detached control fence", async () => {
 
 test("reconnect accepts an explicit target from another connected Chrome profile", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const first = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://a.example", title: "A", active: true },
@@ -1128,7 +1207,7 @@ test("reconnect accepts an explicit target from another connected Chrome profile
 
 test("lists redacted reconnect targets without leaking page content or other ownership", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     {
@@ -1206,7 +1285,7 @@ test("lists redacted reconnect targets without leaking page content or other own
 
 test("a full tab snapshot turns a silently closed browser into a recoverable detach", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -1273,7 +1352,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
   const root = mkdtempSync(join(tmpdir(), "agent-browser-bridge-state-"));
   const statePath = join(root, "sessions.json");
   const firstPort = await freePort();
-  const firstDaemon = new BridgeDaemon({
+  const firstDaemon = createDaemon({
     port: firstPort,
     commandTimeoutMs: 5000,
     statePath,
@@ -1299,7 +1378,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
     cdp.close();
 
     const secondPort = await freePort();
-    const secondDaemon = new BridgeDaemon({
+    const secondDaemon = createDaemon({
       port: secondPort,
       commandTimeoutMs: 5000,
       statePath,
@@ -1363,7 +1442,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
 
 test("session creation rejects non-loopback return origins", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   try {
     for (const returnOrigin of [
@@ -1373,7 +1452,7 @@ test("session creation rejects non-loopback return origins", async () => {
     ]) {
       const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ returnOrigin }),
       });
       assert.equal(response.status, 400);
@@ -1390,7 +1469,7 @@ test("session creation rejects non-loopback return origins", async () => {
 
 test("human control never focuses an arbitrary unscoped browser tab", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://unrelated.example", title: "Unrelated", active: true },
@@ -1413,7 +1492,7 @@ test("human control never focuses an arbitrary unscoped browser tab", async () =
 
 test("control HTTP reports provider focus rejection instead of hanging the request", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
@@ -1433,7 +1512,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
       `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: controlHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ phase: "human" }),
         signal: AbortSignal.timeout(1_000),
       },
@@ -1475,7 +1554,7 @@ test("control HTTP reports provider focus rejection instead of hanging the reque
 
 test("daemon routes CDP events only to the owning bridge session", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://a.example", title: "A", active: true },
@@ -1553,7 +1632,7 @@ test("daemon routes CDP events only to the owning bridge session", async () => {
 
 test("an owned opener adopts its child tab and exposes it only to that bridge session", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     {
@@ -1741,7 +1820,7 @@ test("an owned opener adopts its child tab and exposes it only to that bridge se
 
 test("human-created child ownership is replayed to the agent after its URL becomes automatable", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     {
@@ -2016,14 +2095,18 @@ async function postJson(port, path, body) {
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
     body: JSON.stringify(body),
-    headers: { "content-type": "application/json" },
+    headers: path.startsWith("/control")
+      ? controlHeaders({ "content-type": "application/json" })
+      : { "content-type": "application/json" },
   });
   assert.equal(response.ok, true);
   return await response.json();
 }
 
 async function fetchJson(port, path) {
-  const response = await fetch(`http://127.0.0.1:${port}${path}`);
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+    headers: path.startsWith("/control") ? controlHeaders() : undefined,
+  });
   assert.equal(response.ok, true);
   return await response.json();
 }

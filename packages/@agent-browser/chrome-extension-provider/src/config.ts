@@ -12,6 +12,7 @@ export type BridgeConfig = {
   returnOrigin?: string;
   daemonCommand?: string;
   extensionId?: string;
+  controlToken?: string;
   logPath?: string;
   statePath?: string;
   legacyStatePaths: string[];
@@ -41,12 +42,24 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
     extensionId:
       parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID) ??
       PINNED_CHROME_EXTENSION_ID,
+    controlToken: parseControlToken(env.NEXOLYRA_AGENT_BROWSER_CONTROL_TOKEN),
     logPath,
     statePath,
     legacyStatePaths:
       explicitStatePath || legacyStatePath === statePath ? [] : [legacyStatePath],
     supervisedByNexolyra: env.NEXOLYRA_AGENT_BROWSER_DAEMON_SUPERVISED === "1",
   };
+}
+
+export function parseControlToken(value: string | undefined): string | undefined {
+  const token = nonEmpty(value);
+  if (!token) return undefined;
+  if (!/^[a-f0-9]{64}$/i.test(token)) {
+    throw new Error(
+      "NEXOLYRA_AGENT_BROWSER_CONTROL_TOKEN must be a 64-character hexadecimal secret",
+    );
+  }
+  return token;
 }
 
 export function parseExtensionId(value: string | undefined): string | undefined {

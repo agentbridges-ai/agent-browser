@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
@@ -39,6 +39,7 @@ import { createLogger, type Logger } from "./logger.js";
 export type BridgeDaemonOptions = {
   port: number;
   allowedExtensionId?: string;
+  controlToken?: string;
   logPath?: string;
   commandTimeoutMs?: number;
   detachedTargetGraceMs?: number;
@@ -509,6 +510,13 @@ export class BridgeDaemon {
       this.writeJson(res, 403, { error: "browser-origin requests are not allowed" });
       return;
     }
+    if (
+      (url.pathname === "/control" || url.pathname.startsWith("/control/")) &&
+      !this.hasValidControlToken(req)
+    ) {
+      this.writeJson(res, 401, { error: "Nexolyra control authentication is required" });
+      return;
+    }
     if (req.method === "OPTIONS" && url.pathname === "/health") {
       const corsHeaders = this.healthCorsHeaders(req);
       if (!corsHeaders) {
@@ -655,6 +663,15 @@ export class BridgeDaemon {
       return;
     }
     this.writeJson(res, 404, { error: "not found" });
+  }
+
+  private hasValidControlToken(req: IncomingMessage): boolean {
+    if (!this.options.controlToken) return false;
+    const authorization = req.headers.authorization;
+    if (!authorization?.startsWith("Bearer ")) return false;
+    const provided = Buffer.from(authorization.slice("Bearer ".length), "utf8");
+    const expected = Buffer.from(this.options.controlToken, "utf8");
+    return provided.length === expected.length && timingSafeEqual(provided, expected);
   }
 
   private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
