@@ -1312,7 +1312,7 @@ export class BridgeDaemon {
       return {
         handled: true,
         result: {
-          targetInfos: this.tabsForSession(bridgeSession, peer)
+          targetInfos: this.tabsForCdpDiscovery(bridgeSession, peer)
             .filter(shouldExposeTab)
             .map((tab) =>
               targetInfoFor(
@@ -2185,6 +2185,23 @@ export class BridgeDaemon {
       .map((targetId) => parseTargetId(targetId))
       .filter((ref) => ref?.profileId === peer.profileId)
       .map((ref) => peer.tabs.get(ref!.tabId))
+      .filter((tab): tab is BridgeTab => Boolean(tab));
+  }
+
+  private tabsForCdpDiscovery(session: BridgeSession, peer: ProfilePeer): BridgeTab[] {
+    if (this.controlStates.get(session.sessionId)?.phase !== "resuming") {
+      return this.tabsForSession(session, peer);
+    }
+    // A fresh native transport may remember several tabs owned before the
+    // takeover. During readback expose only the exact attachment selected by
+    // the host's reconnect gate, otherwise native target selection can sample
+    // a sibling tab that the user did not approve for this handoff.
+    return [...this.attachedSessions.values()]
+      .filter(
+        (attached) =>
+          attached.bridgeSessionId === session.sessionId && attached.profileId === peer.profileId,
+      )
+      .map((attached) => peer.tabs.get(attached.tabId))
       .filter((tab): tab is BridgeTab => Boolean(tab));
   }
 

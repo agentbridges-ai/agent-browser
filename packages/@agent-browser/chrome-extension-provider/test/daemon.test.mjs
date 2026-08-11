@@ -1193,6 +1193,35 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
       params: { targetId: attached.result.targetId, flatten: true },
     });
     const oldAttachmentId = attachment.result.sessionId;
+    const siblingTargetId = "tab:profile-a:404";
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 303,
+            windowId: 99,
+            url: "https://example.com/task",
+            title: "Task",
+            active: true,
+          },
+          {
+            tabId: 404,
+            windowId: 99,
+            openerTabId: 303,
+            url: "https://example.com/sibling",
+            title: "Sibling",
+            active: false,
+          },
+        ],
+      }),
+    );
+    await waitFor(async () => {
+      const targets = await cdpCommand(cdp, { id: 3, method: "Target.getTargets", params: {} });
+      return targets.result.targetInfos.some((target) => target.targetId === siblingTargetId);
+    });
     extension.send(
       JSON.stringify({
         v: 1,
@@ -1206,13 +1235,13 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
     await waitFor(async () => (await fetchJson(port, "/control/events?after=0")).events.length === 1);
 
     const targetsAfterClosedTab = await cdpCommand(cdp, {
-      id: 3,
+      id: 4,
       method: "Target.getTargets",
       params: {},
     });
     assert.deepEqual(
       targetsAfterClosedTab.result.targetInfos.map((target) => target.targetId),
-      [],
+      [siblingTargetId],
       "an explicit tab_closed event must remove the stale target before the next heartbeat",
     );
 
@@ -1228,6 +1257,14 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
             url: "http://127.0.0.1:3458/workspace/it/session/session-a",
             title: "Nexolyra",
             active: true,
+          },
+          {
+            tabId: 404,
+            windowId: 2,
+            openerTabId: 303,
+            url: "https://example.com/sibling",
+            title: "Sibling",
+            active: false,
           },
         ],
       }),
