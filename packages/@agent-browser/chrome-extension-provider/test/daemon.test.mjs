@@ -1205,6 +1205,17 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
     );
     await waitFor(async () => (await fetchJson(port, "/control/events?after=0")).events.length === 1);
 
+    const targetsAfterClosedTab = await cdpCommand(cdp, {
+      id: 3,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.deepEqual(
+      targetsAfterClosedTab.result.targetInfos.map((target) => target.targetId),
+      [],
+      "an explicit tab_closed event must remove the stale target before the next heartbeat",
+    );
+
     extension.send(
       JSON.stringify({
         v: 1,

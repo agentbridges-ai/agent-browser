@@ -1601,6 +1601,9 @@ export class BridgeDaemon {
     const pendingActionRisk = [...this.pending.values()].some(
       (pending) => pending.bridgeSessionId === bridgeSession.sessionId,
     );
+    if (reason === "tab_closed") {
+      this.forgetClosedTab(profileId, tabId);
+    }
     this.detachedAttachments.set(bridgeSession.sessionId, {
       sessionId: attached.sessionId,
       profileId: attached.profileId,
@@ -1622,6 +1625,25 @@ export class BridgeDaemon {
       pendingActionRisk,
     });
     this.persistSessions();
+  }
+
+  /**
+   * A chrome.debugger detach notification can arrive before the next tab
+   * heartbeat. Remove an explicitly closed tab immediately so a reconnecting
+   * native client cannot rediscover and select that stale target during the
+   * semantic-readback window.
+   */
+  private forgetClosedTab(profileId: string, tabId: number): void {
+    this.profiles.get(profileId)?.tabs.delete(tabId);
+    const targetId = targetIdFor(profileId, tabId);
+    for (const [bridgeSessionId, scope] of this.sessionTargetScopes) {
+      const ownedRemoved = scope.targetIds.delete(targetId);
+      const attachedRemoved = scope.attachedTargetIds.delete(targetId);
+      const removed = ownedRemoved || attachedRemoved;
+      if (removed && this.controlStates.get(bridgeSessionId)?.phase !== "stopped") {
+        this.broadcastTargetEvent(bridgeSessionId, "Target.targetDestroyed", { targetId });
+      }
+    }
   }
 
   /**
