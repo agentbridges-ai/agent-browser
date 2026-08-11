@@ -73,7 +73,7 @@ export default defineBackground(() => {
       return false;
     }
     if (kind === "bridge-reconnect") {
-      void connectBridge().then(
+      void reconnectBridge().then(
         () =>
           sendResponse({
             connected: bridge !== null && bridge.readyState === WebSocket.OPEN,
@@ -188,6 +188,22 @@ async function connectBridge(): Promise<void> {
   } finally {
     connectInFlight = undefined;
   }
+}
+
+async function reconnectBridge(): Promise<void> {
+  // Configuration can change while the worker is already connected (for
+  // example when Nexolyra assigns an isolated or restarted daemon port). A
+  // regular connect is intentionally idempotent, so an explicit onboarding
+  // reconnect must retire the old transport before resolving configuredPorts.
+  if (connectInFlight) await connectInFlight.catch(() => undefined);
+  const previous = bridge;
+  bridge = null;
+  previous?.close();
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  }
+  await connectBridge();
 }
 
 async function connectBridgeOnce(): Promise<void> {
