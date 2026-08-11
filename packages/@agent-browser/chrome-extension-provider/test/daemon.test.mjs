@@ -621,6 +621,43 @@ test("one-time session nonce inherits human control and cannot be replayed", asy
   }
 });
 
+test("owner-scoped session resume fails closed for ambiguous or mismatched existing sessions", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    await postJson(port, "/sessions", {
+      profileUrlHint: "/session/test-session",
+      returnOrigin: "http://127.0.0.1:3458",
+    });
+    await postJson(port, "/sessions", {
+      profileUrlHint: "/session/test-session",
+      returnOrigin: "http://127.0.0.1:3458",
+    });
+    const lease = await postJson(port, "/session-leases", { grant: sessionGrant() });
+    const ambiguous = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce: lease.nonce }),
+    });
+    assert.equal(ambiguous.status, 409);
+    assert.match((await ambiguous.json()).error, /multiple active/i);
+
+    const mismatched = await fetch(`http://127.0.0.1:${port}/session-leases`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        grant: sessionGrant({ profileUrlHint: "/session/different-session" }),
+      }),
+    });
+    assert.equal(mismatched.status, 409);
+    assert.match((await mismatched.json()).error, /scope does not match/i);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("a daemon restart preserves an owner fence before accepting a stale signed grant", async () => {
   const root = mkdtempSync(join(tmpdir(), "agent-browser-owner-fence-"));
   const statePath = join(root, "sessions.json");
@@ -1086,11 +1123,10 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
   ]);
 
   try {
-    const session = await postJson(port, "/sessions", {
-      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
-      profileUrlHint: "/session/session-a",
-      returnOrigin: "http://127.0.0.1:3458",
+    const initialLease = await postJson(port, "/session-leases", {
+      grant: sessionGrant({ profileUrlHint: "/session/session-a" }),
     });
+    const session = await postJson(port, "/sessions", { nonce: initialLease.nonce });
     const cdp = await connectCdp(port, session.sessionId, session.token);
     const attached = await cdpCommand(cdp, {
       id: 1,
@@ -1152,30 +1188,51 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
     );
     assert.equal((await fetchJson(port, "/control/status")).sessions[0].control.phase, "resuming");
 
-    const targets = await cdpCommand(cdp, { id: 2, method: "Target.getTargets", params: {} });
+    cdp.close();
+    const resumedLease = await postJson(port, "/session-leases", {
+      grant: sessionGrant({ profileUrlHint: "/session/session-a" }),
+    });
+    const resumedSession = await postJson(port, "/sessions", { nonce: resumedLease.nonce });
+    assert.equal(resumedSession.sessionId, session.sessionId);
+    assert.equal(resumedSession.token, session.token);
+    const resumedStatus = await fetchJson(port, "/control/status");
+    assert.equal(resumedStatus.sessions.length, 1);
+    const resumedCdp = await connectCdp(port, resumedSession.sessionId, resumedSession.token);
+    const resumedAttachment = await cdpCommand(resumedCdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:202", flatten: true },
+    });
+    assert.equal(resumedAttachment.result.sessionId, oldAttachmentId);
+
+    const targets = await cdpCommand(resumedCdp, {
+      id: 3,
+      method: "Target.getTargets",
+      params: {},
+    });
     assert.deepEqual(
       targets.result.targetInfos.map((target) => target.targetId),
       ["tab:profile-a:202"],
     );
 
-    const mutating = await cdpCommand(cdp, {
-      id: 3,
+    const mutating = await cdpCommand(resumedCdp, {
+      id: 4,
       sessionId: oldAttachmentId,
       method: "Runtime.evaluate",
       params: { expression: "document.body.textContent = 'changed'" },
     });
     assert.match(mutating.error.message, /semantic readback only/);
 
-    const rendererProbe = await cdpCommand(cdp, {
-      id: 4,
+    const rendererProbe = await cdpCommand(resumedCdp, {
+      id: 5,
       sessionId: oldAttachmentId,
       method: "Runtime.evaluate",
       params: { expression: "1", returnByValue: true },
     });
     assert.equal(rendererProbe.result.result.value, "ok");
 
-    const semanticReadback = await cdpCommand(cdp, {
-      id: 5,
+    const semanticReadback = await cdpCommand(resumedCdp, {
+      id: 6,
       sessionId: oldAttachmentId,
       method: "Accessibility.getFullAXTree",
       params: {},
@@ -1183,14 +1240,14 @@ test("reconnect enters readback-only control and preserves the CDP attachment id
     assert.equal(semanticReadback.result.result.value, "ok");
 
     await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "agent" });
-    const afterHandoff = await cdpCommand(cdp, {
-      id: 6,
+    const afterHandoff = await cdpCommand(resumedCdp, {
+      id: 7,
       sessionId: oldAttachmentId,
       method: "Runtime.evaluate",
       params: { expression: "document.title" },
     });
     assert.equal(afterHandoff.result.result.value, "ok");
-    cdp.close();
+    resumedCdp.close();
   } finally {
     extension.close();
     await daemon.stop();

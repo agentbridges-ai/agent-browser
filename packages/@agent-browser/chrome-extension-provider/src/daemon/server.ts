@@ -464,6 +464,37 @@ export class BridgeDaemon {
     return nonce;
   }
 
+  private reuseOwnerBridgeSession(
+    lease: SessionNonce,
+    control: ControlState,
+  ): BridgeSession | null {
+    const sessions = [...this.bridgeSessions.values()].filter(
+      (session) => session.ownerSessionId === lease.ownerSessionId,
+    );
+    if (sessions.length === 0) return null;
+    if (sessions.length !== 1) {
+      throw new Error("Owner session has multiple active Chrome bridge sessions");
+    }
+    const session = sessions[0];
+    const sessionControl = this.controlStates.get(session.sessionId);
+    if (
+      !sessionControl ||
+      sessionControl.phase === "stopped" ||
+      sessionControl.phase !== control.phase ||
+      sessionControl.epoch !== control.epoch ||
+      !this.sessionTargetScopes.has(session.sessionId)
+    ) {
+      throw new Error("Existing Chrome bridge session is not safe to resume");
+    }
+    if (
+      session.profileUrlHint !== lease.profileUrlHint ||
+      session.returnOrigin !== lease.returnOrigin
+    ) {
+      throw new Error("Existing Chrome bridge session scope does not match the signed grant");
+    }
+    return { ...session };
+  }
+
   /** Register one short-lived CDP entrypoint for a browser.provider launch. */
   createBridgeSession(
     profileId?: string,
@@ -784,14 +815,22 @@ export class BridgeDaemon {
           this.writeJson(res, 409, { error: "Owner control state is unavailable" });
           return;
         }
-        const session = this.createBridgeSession(
-          undefined,
-          lease.ownerSessionId,
-          lease.profileUrlHint,
-          lease.returnOrigin,
-          control,
-        );
-        this.writeJson(res, 200, session);
+        try {
+          const session =
+            this.reuseOwnerBridgeSession(lease, control) ??
+            this.createBridgeSession(
+              undefined,
+              lease.ownerSessionId,
+              lease.profileUrlHint,
+              lease.returnOrigin,
+              control,
+            );
+          this.writeJson(res, 200, session);
+        } catch (error) {
+          this.writeJson(res, 409, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
       const profileId =
