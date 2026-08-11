@@ -53,7 +53,7 @@ Check daemon and extension connectivity:
 agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
-Status includes the unpacked extension path, daemon port, bridge protocol version, connected profile ids, extension id, and current tabs.
+Status includes the unpacked extension path, daemon port, bridge protocol version, connected profile ids, extension id, and immutable extension build identity. Public health omits tab URLs and page content.
 
 ## Configuration
 
@@ -73,6 +73,8 @@ Status includes the unpacked extension path, daemon port, bridge protocol versio
 The extension connects to port `19826` by default. For a custom daemon port, set `chrome.storage.local.bridgePort` or `chrome.storage.local.bridgePorts` in the extension profile to match `AGENT_BROWSER_CHROME_BRIDGE_PORT`.
 
 The daemon pins `/bridge` to the bundled extension id by default and validates both the browser-supplied WebSocket Origin and the extension hello identity. It also rejects browser-origin requests from host control routes while allowing the pinned extension to read the onboarding health route. This prevents an ordinary web page or a different extension from impersonating or mutating the bridge. Set `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` only when testing a custom build with a different manifest identity.
+
+When Nexolyra supervises the daemon, it also pins the exact committed provider git tree embedded into the extension build. A stale unpacked extension with the same semantic version is rejected before any profile or task tab is exposed.
 
 ## How it works
 

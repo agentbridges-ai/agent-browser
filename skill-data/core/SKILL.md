@@ -225,6 +225,8 @@ agent-browser plugin run captcha captcha.solve --payload '{"siteKey":"...","url"
 agent-browser plugin run chrome-extension chrome-extension.status
 ```
 
+In a Nexolyra-supervised session, readiness requires the exact committed provider git tree embedded into the extension build. If status reports a build identity mismatch, rebuild and reload the pinned unpacked extension instead of retrying browser commands.
+
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths.
 
 ### Persist session across runs

@@ -3447,6 +3447,9 @@ Capabilities:
   command.run              Accept arbitrary namespaced plugin requests
   chrome-extension.manage  Inspect the optional Chrome extension bridge
 
+Nexolyra-supervised Chrome extension bridges require the exact committed
+provider git tree embedded into the loaded extension build.
+
 Core capabilities and protocol request types use dedicated command paths.
 Use auth login for credential.read, --provider for browser.provider, and
 a local launch for launch.mutate.

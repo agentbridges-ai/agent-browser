@@ -7,6 +7,7 @@ import {
 } from "../src/protocol";
 
 declare const __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__: number;
+declare const __AGENT_BROWSER_EXTENSION_BUILD_IDENTITY__: string;
 
 type StoredConfig = {
   bridgeProfileId?: string;
@@ -733,6 +734,7 @@ async function sendHello() {
     profileId: await getProfileId(),
     extensionId: chrome.runtime.id,
     extensionVersion: chrome.runtime.getManifest().version,
+    extensionBuildIdentity: __AGENT_BROWSER_EXTENSION_BUILD_IDENTITY__,
     chromeVersion: chromeVersion(),
     tabs: await allTabs(),
   });

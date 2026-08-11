@@ -6,11 +6,17 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
-import { parseExtensionId, readBridgeConfig, readControlSecretsFd } from "../dist/config.js";
+import {
+  parseExtensionBuildIdentity,
+  parseExtensionId,
+  readBridgeConfig,
+  readControlSecretsFd,
+} from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 
 const TEST_CONTROL_TOKEN = "a".repeat(64);
 const TEST_SESSION_GRANT_SECRET = "b".repeat(64);
+const TEST_EXTENSION_BUILD_IDENTITY = `git-tree:${"c".repeat(40)}`;
 
 test("control secrets fd is consumed once and closed", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-browser-control-fd-"));
@@ -20,6 +26,7 @@ test("control secrets fd is consumed once and closed", () => {
     JSON.stringify({
       controlToken: TEST_CONTROL_TOKEN,
       sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+      extensionBuildIdentity: TEST_EXTENSION_BUILD_IDENTITY,
     }),
   );
   const fd = openSync(path, "r");
@@ -27,6 +34,7 @@ test("control secrets fd is consumed once and closed", () => {
     assert.deepEqual(readControlSecretsFd(fd), {
       controlToken: TEST_CONTROL_TOKEN,
       sessionGrantSecret: TEST_SESSION_GRANT_SECRET,
+      extensionBuildIdentity: TEST_EXTENSION_BUILD_IDENTITY,
     });
     assert.throws(() => fstatSync(fd), /bad file descriptor/i);
   } finally {
@@ -73,6 +81,19 @@ test("extension allowlist configuration accepts only canonical Chrome ids", () =
     "pimcamjccpkgapdpecfiadkemnggggbj",
   );
   assert.throws(() => parseExtensionId("extension-id"), /32-character Chrome extension id/);
+});
+
+test("extension build identity accepts only canonical git tree provenance", () => {
+  assert.equal(parseExtensionBuildIdentity(undefined), undefined);
+  assert.equal(
+    parseExtensionBuildIdentity(` git-tree:${"a".repeat(40)} `),
+    `git-tree:${"a".repeat(40)}`,
+  );
+  assert.throws(() => parseExtensionBuildIdentity("0.33.2"), /git-tree/);
+  assert.throws(
+    () => parseExtensionBuildIdentity(`git-tree:${"a".repeat(39)}`),
+    /git-tree/,
+  );
 });
 
 test("daemon state defaults to the fixed agent-browser user directory", () => {
@@ -157,6 +178,7 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
     port,
     commandTimeoutMs: 5000,
     supervisedByNexolyra: true,
+    allowedExtensionBuildIdentity: TEST_EXTENSION_BUILD_IDENTITY,
   });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
@@ -358,17 +380,20 @@ test("daemon prevents another bridge session from attaching an already controlle
 
 test("daemon accepts only the pinned Chrome extension origin and identity", async () => {
   const extensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
+  const extensionBuildIdentity = TEST_EXTENSION_BUILD_IDENTITY;
   const port = await freePort();
   const daemon = createDaemon({
     port,
     commandTimeoutMs: 5000,
     allowedExtensionId: extensionId,
+    allowedExtensionBuildIdentity: extensionBuildIdentity,
   });
   await daemon.start();
 
   try {
     const health = await fetchJson(port, "/health");
     assert.equal(health.allowedExtensionId, extensionId);
+    assert.equal(health.allowedExtensionBuildIdentity, extensionBuildIdentity);
     const extensionOrigin = `chrome-extension://${extensionId}`;
     const trustedHealth = await fetch(`http://127.0.0.1:${port}/health`, {
       headers: { Origin: extensionOrigin },
@@ -413,10 +438,33 @@ test("daemon accepts only the pinned Chrome extension origin and identity", asyn
     assert.match((await rejected).message, /not allowed/i);
     wrongIdentity.close();
 
+    const staleBuild = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
+      headers: { Origin: `chrome-extension://${extensionId}` },
+    });
+    await onceOpen(staleBuild);
+    const staleRejected = onceJsonMessage(staleBuild);
+    staleBuild.send(
+      JSON.stringify({
+        v: 1,
+        kind: "hello",
+        profileId: "stale-profile",
+        extensionId,
+        extensionVersion: "0.33.2",
+        extensionBuildIdentity: `git-tree:${"d".repeat(40)}`,
+        chromeVersion: "120.0.0.0",
+        tabs: [],
+      }),
+    );
+    assert.match((await staleRejected).message, /build identity is not allowed/i);
+    staleBuild.close();
+
     const extension = await connectExtension(port, "profile-a", [], {
       extensionId,
       origin: `chrome-extension://${extensionId}`,
+      extensionBuildIdentity,
     });
+    const connectedHealth = await fetchJson(port, "/health");
+    assert.equal(connectedHealth.profiles[0].extensionBuildIdentity, extensionBuildIdentity);
     extension.close();
   } finally {
     await daemon.stop();
@@ -2387,6 +2435,7 @@ async function connectExtension(port, profileId, tabs, options = {}) {
       profileId,
       extensionId: options.extensionId ?? "extension-id",
       extensionVersion: "0.31.1",
+      extensionBuildIdentity: options.extensionBuildIdentity ?? TEST_EXTENSION_BUILD_IDENTITY,
       chromeVersion: "120.0.0.0",
       tabs,
     }),

@@ -26,6 +26,7 @@ export type BridgeConfig = {
 export function readControlSecretsFd(fd: number): {
   controlToken: string;
   sessionGrantSecret: string;
+  extensionBuildIdentity: string;
 } {
   try {
     const secrets = JSON.parse(readFileSync(fd, "utf8")) as Record<string, unknown>;
@@ -35,10 +36,17 @@ export function readControlSecretsFd(fd: number): {
     const sessionGrantSecret = parseSessionGrantSecret(
       typeof secrets.sessionGrantSecret === "string" ? secrets.sessionGrantSecret : undefined,
     );
-    if (!controlToken || !sessionGrantSecret) {
-      throw new Error("Control fd did not contain both required Chrome bridge secrets");
+    const extensionBuildIdentity = parseExtensionBuildIdentity(
+      typeof secrets.extensionBuildIdentity === "string"
+        ? secrets.extensionBuildIdentity
+        : undefined,
+    );
+    if (!controlToken || !sessionGrantSecret || !extensionBuildIdentity) {
+      throw new Error(
+        "Control fd did not contain the required Chrome bridge secrets and extension build identity",
+      );
     }
-    return { controlToken, sessionGrantSecret };
+    return { controlToken, sessionGrantSecret, extensionBuildIdentity };
   } finally {
     closeSync(fd);
   }
@@ -131,6 +139,18 @@ export function parseExtensionId(value: string | undefined): string | undefined 
     );
   }
   return extensionId;
+}
+
+/** Immutable provider source identity embedded into one extension build. */
+export function parseExtensionBuildIdentity(value: string | undefined): string | undefined {
+  const identity = nonEmpty(value);
+  if (!identity) return undefined;
+  if (!/^git-tree:[a-f0-9]{40}$/.test(identity)) {
+    throw new Error(
+      "Chrome extension build identity must use git-tree:<40 lowercase hexadecimal characters>",
+    );
+  }
+  return identity;
 }
 
 export function parsePort(value: string | undefined): number {
