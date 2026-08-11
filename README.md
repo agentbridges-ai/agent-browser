@@ -869,6 +869,8 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 
 The optional `@agent-browser/chrome-extension-provider` package adds a `chrome-extension` provider that connects to the user's already running desktop Chrome through an unpacked MV3 extension and local bridge daemon. It is only active when configured as a plugin and selected with `--provider chrome-extension`; default local launch, `--cdp`, `--auto-connect`, and `--profile` behavior are unchanged.
 
+Nexolyra-supervised daemons pin both the Chrome extension id and the committed provider git tree embedded into the extension build. This rejects stale unpacked builds even when their package version is unchanged.
+
 | Variable | Description |
 | -------- | ----------- |
 | `AGENT_BROWSER_CHROME_BRIDGE_PORT` | Local daemon port for the Chrome extension bridge, default `19826` |
@@ -1852,6 +1854,8 @@ When enabled, agent-browser connects to an AgentCore cloud browser session inste
 ### Chrome Extension Bridge
 
 The optional `@agent-browser/chrome-extension-provider` package connects agent-browser to an already running desktop Chrome profile through an unpacked MV3 extension and a local bridge daemon. The plugin returns a local CDP WebSocket URL, so browser automation, snapshots, policy checks, and output handling remain in agent-browser core.
+
+Supervised deployments require the exact provider git tree identity embedded at extension build time. The daemon rejects a missing or stale identity before exposing an extension profile.
 
 Build and load the unpacked extension:
 

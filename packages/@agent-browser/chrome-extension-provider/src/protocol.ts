@@ -46,6 +46,7 @@ export type BridgeHello = {
   profileId: string;
   extensionId: string;
   extensionVersion?: string;
+  extensionBuildIdentity?: string;
   chromeVersion?: string;
   tabs?: BridgeTab[];
 };

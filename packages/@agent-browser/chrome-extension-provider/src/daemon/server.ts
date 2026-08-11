@@ -39,6 +39,7 @@ import { createLogger, type Logger } from "./logger.js";
 export type BridgeDaemonOptions = {
   port: number;
   allowedExtensionId?: string;
+  allowedExtensionBuildIdentity?: string;
   controlToken?: string;
   sessionGrantSecret?: string;
   logPath?: string;
@@ -54,6 +55,7 @@ type ProfilePeer = {
   profileId: string;
   extensionId: string;
   extensionVersion?: string;
+  extensionBuildIdentity?: string;
   chromeVersion?: string;
   ws: WebSocket;
   tabs: Map<number, BridgeTab>;
@@ -209,6 +211,14 @@ export class BridgeDaemon {
     if (!this.options.sessionGrantSecret || !/^[a-f0-9]{64}$/i.test(this.options.sessionGrantSecret)) {
       throw new Error("Chrome bridge session grant secret must be a 64-character hexadecimal secret");
     }
+    if (
+      this.options.supervisedByNexolyra &&
+      !/^git-tree:[a-f0-9]{40}$/.test(this.options.allowedExtensionBuildIdentity ?? "")
+    ) {
+      throw new Error(
+        "A supervised Chrome bridge daemon requires an exact extension build identity",
+      );
+    }
     this.logger = createLogger(options.logPath);
     this.loadPersistedSessions();
     this.server = createServer((req, res) => {
@@ -331,6 +341,7 @@ export class BridgeDaemon {
       version: CHROME_EXTENSION_PROVIDER_VERSION,
       bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
       allowedExtensionId: this.options.allowedExtensionId ?? null,
+      allowedExtensionBuildIdentity: this.options.allowedExtensionBuildIdentity ?? null,
       port: this.options.port,
       processId: process.pid,
       supervisedByNexolyra: this.options.supervisedByNexolyra === true,
@@ -338,6 +349,7 @@ export class BridgeDaemon {
         profileId: peer.profileId,
         extensionId: peer.extensionId,
         extensionVersion: peer.extensionVersion ?? null,
+        extensionBuildIdentity: peer.extensionBuildIdentity ?? null,
         chromeVersion: peer.chromeVersion ?? null,
         tabCount: peer.tabs.size,
         tabs: [...peer.tabs.values()],
@@ -360,6 +372,7 @@ export class BridgeDaemon {
       version: status.version,
       bridgeProtocolVersion: status.bridgeProtocolVersion,
       allowedExtensionId: status.allowedExtensionId,
+      allowedExtensionBuildIdentity: status.allowedExtensionBuildIdentity,
       port: status.port,
       processId: status.processId,
       supervisedByNexolyra: status.supervisedByNexolyra,
@@ -1169,11 +1182,26 @@ export class BridgeDaemon {
         ws.close();
         return;
       }
+      if (
+        this.options.allowedExtensionBuildIdentity &&
+        message.extensionBuildIdentity !== this.options.allowedExtensionBuildIdentity
+      ) {
+        ws.send(
+          JSON.stringify({
+            v: BRIDGE_PROTOCOL_VERSION,
+            kind: "error",
+            message: "extension build identity is not allowed",
+          }),
+        );
+        ws.close();
+        return;
+      }
       const previousTabs = this.profiles.get(message.profileId)?.tabs ?? new Map<number, BridgeTab>();
       this.profiles.set(message.profileId, {
         profileId: message.profileId,
         extensionId: message.extensionId,
         extensionVersion: message.extensionVersion,
+        extensionBuildIdentity: message.extensionBuildIdentity,
         chromeVersion: message.chromeVersion,
         ws,
         tabs: tabsToMap(message.tabs ?? []),

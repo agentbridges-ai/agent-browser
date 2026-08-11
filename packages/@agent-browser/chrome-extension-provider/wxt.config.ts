@@ -1,20 +1,48 @@
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "wxt";
+
+const PROVIDER_PATH = "packages/@agent-browser/chrome-extension-provider";
+const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
+
+function providerBuildIdentity(): string {
+  const dirty = execFileSync("git", ["status", "--porcelain", "--", PROVIDER_PATH], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  }).trim();
+  if (dirty) {
+    throw new Error(
+      "Refusing to build the Chrome extension from a dirty provider tree; commit the provider sources first",
+    );
+  }
+  const treeSha = execFileSync("git", ["rev-parse", `HEAD:${PROVIDER_PATH}`], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  }).trim();
+  if (!/^[a-f0-9]{40}$/.test(treeSha)) {
+    throw new Error("Unable to derive the Chrome extension provider git tree identity");
+  }
+  return `git-tree:${treeSha}`;
+}
 
 const configuredBridgePort = Number(process.env.AGENT_BROWSER_E2E_BRIDGE_PORT ?? 19826);
 const defaultBridgePort =
   Number.isInteger(configuredBridgePort) && configuredBridgePort > 0 && configuredBridgePort <= 65535
     ? configuredBridgePort
     : 19826;
+const extensionBuildIdentity = providerBuildIdentity();
 
 export default defineConfig({
   vite: () => ({
     define: {
       __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__: JSON.stringify(defaultBridgePort),
+      __AGENT_BROWSER_EXTENSION_BUILD_IDENTITY__: JSON.stringify(extensionBuildIdentity),
     },
   }),
   manifest: {
     name: "Agent Browser Bridge",
     version: "0.33.2",
+    version_name: `0.33.2+${extensionBuildIdentity.slice("git-tree:".length, "git-tree:".length + 12)}`,
     minimum_chrome_version: "120",
     permissions: ["debugger", "tabs", "storage", "alarms"],
     // This narrow grant is only for onboarding's loopback health probe. Page

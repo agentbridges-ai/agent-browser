@@ -8,8 +8,11 @@ import { BridgeDaemon } from "./server.js";
 const config = readBridgeConfig();
 let controlToken = config.controlToken;
 let sessionGrantSecret = config.sessionGrantSecret;
+let extensionBuildIdentity: string | undefined;
 if (config.controlSecretsFd !== undefined) {
-  ({ controlToken, sessionGrantSecret } = readControlSecretsFd(config.controlSecretsFd));
+  ({ controlToken, sessionGrantSecret, extensionBuildIdentity } = readControlSecretsFd(
+    config.controlSecretsFd,
+  ));
 }
 if (config.supervisedByNexolyra && config.controlSecretsFd === undefined) {
   throw new Error("A supervised Chrome bridge daemon requires a private inherited control fd");
@@ -22,6 +25,7 @@ if (!controlToken || !sessionGrantSecret) {
 const daemon = new BridgeDaemon({
   port: config.port,
   allowedExtensionId: config.extensionId,
+  allowedExtensionBuildIdentity: extensionBuildIdentity,
   controlToken,
   sessionGrantSecret,
   logPath: config.logPath,
