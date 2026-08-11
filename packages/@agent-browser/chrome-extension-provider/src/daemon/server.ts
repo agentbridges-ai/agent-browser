@@ -492,6 +492,11 @@ export class BridgeDaemon {
     ) {
       throw new Error("Existing Chrome bridge session scope does not match the signed grant");
     }
+    this.logger.debug("owner-scoped Chrome bridge session reused", {
+      ownerSessionId: lease.ownerSessionId,
+      sessionId: session.sessionId,
+      phase: sessionControl.phase,
+    });
     return { ...session };
   }
 
@@ -539,11 +544,20 @@ export class BridgeDaemon {
     }
     this.controlStates.set(session.sessionId, { ...control });
     this.persistSessions();
+    this.logger.debug("Chrome bridge session created", {
+      ownerSessionId: ownerSessionId ?? null,
+      sessionId: session.sessionId,
+      phase: control.phase,
+    });
     return session;
   }
 
   async detachBridgeSession(sessionId: string): Promise<boolean> {
     const session = this.bridgeSessions.get(sessionId);
+    this.logger.debug("Chrome bridge session detach requested", {
+      ownerSessionId: session?.ownerSessionId ?? null,
+      sessionId,
+    });
     if (session) {
       await this.setBridgeControl(session, "stopped");
       this.sessionTargetScopes.get(sessionId)?.attachedTargetIds.clear();
@@ -559,6 +573,33 @@ export class BridgeDaemon {
     }
     this.persistSessions();
     return existed;
+  }
+
+  private preserveOwnerFenceForTransportRestart(sessionId: string): boolean {
+    const session = this.bridgeSessions.get(sessionId);
+    const control = this.controlStates.get(sessionId);
+    if (
+      !session?.ownerSessionId ||
+      !control ||
+      (control.phase !== "human" &&
+        control.phase !== "detached" &&
+        control.phase !== "resuming")
+    ) {
+      return false;
+    }
+    for (const [client, bridgeSessionId] of this.cdpClients) {
+      if (bridgeSessionId !== sessionId) continue;
+      this.cdpClients.delete(client);
+      this.targetDiscoveryClients.delete(client);
+      client.close(1001, "provider transport restarting");
+    }
+    this.persistSessions();
+    this.logger.debug("Chrome bridge owner fence preserved across provider transport restart", {
+      ownerSessionId: session.ownerSessionId,
+      sessionId,
+      phase: control.phase,
+    });
+    return true;
   }
 
   private loadPersistedSessions(): void {
@@ -990,8 +1031,14 @@ export class BridgeDaemon {
         this.writeJson(res, 400, { error: "bridge session id is invalid" });
         return;
       }
-      if (!this.hasValidControlToken(req) && !this.hasValidSessionToken(req, sessionId)) {
+      const hostAuthorized = this.hasValidControlToken(req);
+      const sessionAuthorized = this.hasValidSessionToken(req, sessionId);
+      if (!hostAuthorized && !sessionAuthorized) {
         this.writeJson(res, 401, { error: "Bridge session authentication is required" });
+        return;
+      }
+      if (!hostAuthorized && this.preserveOwnerFenceForTransportRestart(sessionId)) {
+        this.writeJson(res, 200, { detached: false, preserved: true });
         return;
       }
       this.writeJson(res, 200, { detached: await this.detachBridgeSession(sessionId) });
@@ -1321,6 +1368,13 @@ export class BridgeDaemon {
             entry.tabId === ref.tabId,
         );
         if (!existing) {
+          this.logger.error("semantic readback target did not match a preserved attachment", {
+            bridgeSessionId: bridgeSession.sessionId,
+            requestedTargetId: targetId,
+            preservedTargetIds: [...this.attachedSessions.values()]
+              .filter((entry) => entry.bridgeSessionId === bridgeSession.sessionId)
+              .map((entry) => targetIdFor(entry.profileId, entry.tabId)),
+          });
           throw new Error("Semantic readback can attach only to the reconnected task tab");
         }
         return { handled: true, result: { sessionId: existing.sessionId } };

@@ -717,6 +717,60 @@ test("session detach requires either host control or the matching bridge token",
   }
 });
 
+test("a provider transport restart preserves a resuming owner attachment", async () => {
+  const port = await freePort();
+  const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const initialLease = await postJson(port, "/session-leases", { grant: sessionGrant() });
+    const session = await postJson(port, "/sessions", { nonce: initialLease.nonce });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.createTarget",
+      params: { url: "https://example.com/task" },
+    });
+    const attachment = await cdpCommand(cdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: attached.result.targetId, flatten: true },
+    });
+    await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", { phase: "resuming" });
+
+    const transportClose = await fetch(
+      `http://127.0.0.1:${port}/sessions/${encodeURIComponent(session.sessionId)}/detach`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${session.token}` },
+      },
+    );
+    assert.equal(transportClose.status, 200);
+    assert.deepEqual(await transportClose.json(), { detached: false, preserved: true });
+
+    const resumedLease = await postJson(port, "/session-leases", { grant: sessionGrant() });
+    const resumed = await postJson(port, "/sessions", { nonce: resumedLease.nonce });
+    assert.equal(resumed.sessionId, session.sessionId);
+    assert.equal(resumed.token, session.token);
+    const resumedCdp = await connectCdp(port, resumed.sessionId, resumed.token);
+    const resumedAttachment = await cdpCommand(resumedCdp, {
+      id: 3,
+      method: "Target.attachToTarget",
+      params: { targetId: attached.result.targetId, flatten: true },
+    });
+    assert.equal(resumedAttachment.result.sessionId, attachment.result.sessionId);
+    assert.equal((await fetchJson(port, "/control/status")).sessions.length, 1);
+    resumedCdp.close();
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
 test("public health redacts session ownership and tab details", async () => {
   const port = await freePort();
   const daemon = createDaemon({ port, commandTimeoutMs: 5000 });
