@@ -42,7 +42,7 @@ export default defineConfig({
   manifest: {
     name: "Agent Browser Bridge",
     version: "0.33.2",
-    version_name: `0.33.2+${extensionBuildIdentity.slice("git-tree:".length, "git-tree:".length + 12)}`,
+    version_name: `0.33.2+${extensionBuildIdentity}`,
     minimum_chrome_version: "120",
     permissions: ["debugger", "tabs", "storage", "alarms"],
     // This narrow grant is only for onboarding's loopback health probe. Page
