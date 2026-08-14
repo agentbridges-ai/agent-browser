@@ -19,7 +19,7 @@
     "build:extension": "wxt build --browser chrome",
     "build:node": "tsc -p tsconfig.json",
     "prepack": "pnpm run build",
-    "test": "pnpm run build:node && node --test test/daemon.test.mjs test/plugin.test.mjs",
+    "test": "pnpm run build:node && node --test test/daemon.test.mjs test/logger.test.mjs test/plugin.test.mjs",
     "test:browser-e2e": "pnpm run build && node --test test/browser-e2e.test.mjs"
   },
   "keywords": [
