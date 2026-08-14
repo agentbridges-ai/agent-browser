@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { closeSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 export const DEFAULT_BRIDGE_PORT = 19826;
 export const PINNED_CHROME_EXTENSION_ID = "pimcamjccpkgapdpecfiadkemnggggbj";
@@ -16,6 +16,7 @@ export type BridgeConfig = {
   controlToken?: string;
   controlSecretsFd?: number;
   sessionGrant?: string;
+  sessionGrantHelper?: string;
   sessionGrantSecret?: string;
   logPath?: string;
   statePath?: string;
@@ -78,6 +79,9 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
     controlToken: parseControlToken(env.NEXOLYRA_AGENT_BROWSER_CONTROL_TOKEN),
     controlSecretsFd: parseControlSecretsFd(env.NEXOLYRA_AGENT_BROWSER_CONTROL_FD),
     sessionGrant: parseSessionGrant(env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT),
+    sessionGrantHelper: parseSessionGrantHelper(
+      env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT_HELPER,
+    ),
     sessionGrantSecret: parseSessionGrantSecret(
       env.NEXOLYRA_AGENT_BROWSER_SESSION_GRANT_SECRET,
     ),
@@ -106,6 +110,15 @@ export function parseSessionGrant(value: string | undefined): string | undefined
     throw new Error("NEXOLYRA_AGENT_BROWSER_SESSION_GRANT is malformed");
   }
   return grant;
+}
+
+export function parseSessionGrantHelper(value: string | undefined): string | undefined {
+  const helper = nonEmpty(value);
+  if (!helper) return undefined;
+  if (helper.includes("\0") || !isAbsolute(helper)) {
+    throw new Error("NEXOLYRA_AGENT_BROWSER_SESSION_GRANT_HELPER must be an absolute path");
+  }
+  return helper;
 }
 
 export function parseSessionGrantSecret(value: string | undefined): string | undefined {

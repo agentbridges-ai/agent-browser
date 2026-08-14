@@ -1,8 +1,13 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { defaultDaemonScriptPath, readBridgeConfig } from "./config.js";
+import {
+  defaultDaemonScriptPath,
+  parseSessionGrant,
+  readBridgeConfig,
+  type BridgeConfig,
+} from "./config.js";
 import {
   BRIDGE_PROTOCOL_VERSION,
   CAPABILITY_BROWSER_PROVIDER,
@@ -65,11 +70,7 @@ async function launchBrowserProvider(): Promise<PluginResponse> {
       `no Chrome extension profile connected on port ${config.port}; load the unpacked extension at ${extensionPath()} and retry`,
     );
   }
-  const session = await createSession(
-    config.port,
-    config.profileId,
-    config.sessionGrant,
-  );
+  const session = await createSession(config.port, config.profileId, await sessionGrantFor(config));
   return {
     protocol: PLUGIN_PROTOCOL,
     success: true,
@@ -88,6 +89,33 @@ async function launchBrowserProvider(): Promise<PluginResponse> {
       },
     },
   };
+}
+
+async function sessionGrantFor(config: BridgeConfig): Promise<string | undefined> {
+  if (!config.sessionGrantHelper) return config.sessionGrant;
+  const stdout = await new Promise<string>((resolve, reject) => {
+    execFile(
+      config.sessionGrantHelper!,
+      [],
+      {
+        encoding: "utf8",
+        env: process.env,
+        maxBuffer: 8192,
+        timeout: 10_000,
+        windowsHide: true,
+      },
+      (error, output) => {
+        if (error) {
+          reject(new Error("Nexolyra browser session grant helper failed"));
+          return;
+        }
+        resolve(output);
+      },
+    );
+  });
+  const grant = parseSessionGrant(stdout.trim());
+  if (!grant) throw new Error("Nexolyra browser session grant helper returned no grant");
+  return grant;
 }
 
 async function closeBrowserProvider(request: Record<string, unknown>): Promise<PluginResponse> {
